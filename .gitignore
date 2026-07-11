@@ -1,1 +1,6 @@
 .DS_Store
+.env
+token.json
+credentials.json
+exported_docs_for_rag/
+local_traces/
