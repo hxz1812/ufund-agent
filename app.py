@@ -28,6 +28,8 @@ import tiktoken
 import numpy as np
 from langchain_core.load import dumps, loads
 
+from typing import Any, List, Optional
+
 
 model_path = str(Path.home() / "Desktop" / "agents-from-scratch" / "models" / "llama-3-8b-instruct.gguf")
 
@@ -62,29 +64,49 @@ GOOGLE_EXPORT_TYPES = {
 
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
-openai_api_key = os.getenv("OPENAI_API_KEY")
-if not openai_api_key:
-    raise RuntimeError("Missing OPENAI_API_KEY. Add it to your .env file.")
 
+RAG_ANSWER_SCHEMA = """
+{
+  "answer": "string",
+  "evidence_files": ["string"],
+  "confidence": "high | medium | low",
+  "missing_information": ["string"]
+}
+"""
+
+TOOL_CHOICES = [
+    "calculator",
+    "search_docs",
+    "summarize_docs",
+    "answer_from_docs",
+    "none",
+]
+
+class AgentState:
+    def __init__(self):
+        self.steps=0
+        self.done=False
+    def reset(self):
+        self.steps=0
+        self.done=False
+    def increment_step(self):
+        self.steps+=1
+    def mark_done(self):
+        self.done=True
+    def to_dict(self):
+        return {"steps": self.steps, "done": self.done}
 
 def main() -> None:
-    #user inputs
-    parser=argparse.ArgumentParser()
-    parser.add_argument("--prompt", required=True)
-    parser.add_argument("--max-tokens", type=int, default=512)
-    parser.add_argument("--temperature", type=float, default=0)
-    parser.add_argument("--n-ctx",type=int,default=2048)
-    parser.add_argument("--max-steps", type=int, default=5)
-    parser.add_argument("--export-drive", type=bool,default=False)
-
-    args = parser.parse_args()
-
+    args = parse_args()
+    
     user_input=args.prompt
     max_tokens=args.max_tokens
     temperature=args.temperature
     n_ctx=args.n_ctx
     max_steps=args.max_steps
     export_drive=args.export_drive
+    llm_provider=args.llm_provider
+    openai_model=args.openai_model
 
     system_prompt=("You are an assistant who truthfully and thoughtfully answers questions the members of UFund Investment LLC have.")
 
@@ -97,14 +119,6 @@ CRITICAL INSTRUCTIONS:
 User request: {user_input}
 
 Response:"""
-
-    #local model
-    llm = Llama(
-        model_path=model_path,
-        temperature=temperature,
-        n_ctx=n_ctx,
-        verbose=False,
-    )
 
     kwargs = {
         "prompt": prompt,
@@ -125,6 +139,11 @@ Response:"""
     DOCS_PATH="exported_docs_for_rag"
     docs,skipped_files=indexing(DOCS_PATH)
 
+    
+    #getting llm
+    llm_config=build_llm(llm_provider=llm_provider,model_path=model_path,
+                         n_ctx=n_ctx,temperature=temperature,openai_model=openai_model)
+
     #embedder
     #embd = OpenAIEmbeddings()
 
@@ -142,10 +161,11 @@ Response:"""
         #embedding=OpenAIEmbeddings(),
         )
 
-    #retriever
+    #retrieve docs
     retriever=vectorstore.as_retriever(
         search_kwargs={"k":4}
         )
+    retrieved_docs=retriever.invoke(user_input) 
 
     #answer FOR OPENAI
     '''answer_chain = prompt | llm | StrOutputParser()
@@ -165,8 +185,7 @@ Response:"""
         print()'''
 
     #LOCAL LLM ANSWER
-    retrieved_docs=retriever.invoke(user_input)
-    answer=answer_with_local_llm(
+    '''answer=answer_with_local_llm(
         llm=llm,
         user_input=user_input,
         retrieved_docs=retrieved_docs,
@@ -174,7 +193,43 @@ Response:"""
         max_tokens=max_tokens,
         temperature=temperature
         )
-    print(answer)
+    print(answer)'''
+
+    #structured output
+    structured_answer = answer_rag_structured(
+        llm_config=llm_config,
+        user_input=user_input,
+        retrieved_docs=retrieved_docs,
+        system_prompt=system_prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+
+    if structured_answer is None:
+        print("Model failed to return valid JSON.")
+    else:
+        print(json.dumps(structured_answer, indent=2, ensure_ascii=False))
+
+    #decide() test
+    choices=["answer_from_context","not_enough_context"]
+    decide_test=decide(llm_config=llm_config,system_prompt=system_prompt,
+                       user_input=user_input,choices=choices,)
+    print("Decide test:", decide_test)
+
+    #tool test
+    tool_test=request_tool(llm_config=llm_config,system_prompt=system_prompt,
+                           user_input=user_input)
+
+    #loops
+    results=run_loop(llm_config,system_prompt,user_input)
+    for i, result in enumerate(results,1):
+        print(f"Iteration {i}:")
+        action = result.get("action","unknown")
+        reason = result.get("reason","No reason provided")
+        print(f"  Action: {action}")
+        print(f"  Reason: {reason}")
+        if i < len(results):
+            print()
 
     #multi query
     template = """You are an AI language modle assistant. Your task is to generate
@@ -193,6 +248,59 @@ Original question: {question}"""
     retrieval_chain = generate_queries | retriever.map() | get_unique_union
     docs = retrieval_chain.invoke({"question":user_input})
     #print(len(docs))
+
+##############
+# PARSE ARGS #
+##############
+def parse_args():
+    parser=argparse.ArgumentParser()
+    parser.add_argument("--prompt", required=True)
+    parser.add_argument("--max-tokens", type=int, default=512)
+    parser.add_argument("--temperature", type=float, default=0)
+    parser.add_argument("--n-ctx",type=int,default=2048)
+    parser.add_argument("--max-steps", type=int, default=5)
+    parser.add_argument("--export-drive", action="store_true")
+    parser.add_argument("--llm-provider", choices=["local","openai"],default="local",)
+    parser.add_argument("--openai-model", default="gpt-3.5-turbo",)
+    return parser.parse_args()
+
+###############
+# GETTING LLM #
+###############
+def build_llm(llm_provider,model_path,n_ctx,temperature,openai_model):
+    if llm_provider=="local":
+        return {
+            "provider": "local",
+            "client": Llama(
+                model_path=str(model_path),
+                temperature=temperature,
+                n_ctx=n_ctx,
+                verbose=False,
+                ),
+            }
+    if llm_provider=="openai":
+        if not os.getenv("OPENAI_API_KEY"):
+            raise RuntimeError("Missing OPENAI_API_KEY")
+        return {
+            "provider": "openai",
+            "client": ChatOpenAI(
+                model_name=openai_model,
+                temperature=temperature,
+                ),
+            }
+    raise ValueError(f"Unsupported LLM provider: {llm_provider}")
+
+def call_llm_text(llm_config, prompt, max_tokens=512, temperature=0, stop=None,):
+    provider=llm_config["provider"]
+    client = llm_config["client"]
+    if provider == "local":
+        response= client(prompt=prompt,max_tokens=max_tokens,temperature=temperature,stop=stop or ["<|eot_id|>", "User:"])
+        return response["choices"][0]["text"].strip()
+    if provider=="openai":
+        response=client.invoke(prompt)
+        return response.content.strip()
+    raise ValueError(f"Unsupported LLM provider: {provider}")
+        
     
 ##########################
 #    GDRIVE FUNCTIONS    #
@@ -423,6 +531,234 @@ def get_unique_union(documents: list[list]):
     flattened_docs=[dumps(doc) for sublist in documents for doc in sublist]
     unique_docs=list(set(flattened_docs))
     return [loads(doc) for doc in unique_docs]
+
+#####################
+# STRUCTURED OUTPUT #
+#####################
+def extract_json_from_text(text: str) -> dict | None:
+    text = text.strip()
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    try:
+        return json.loads(text[start:end+1])
+    except json.JSONDecodeError:
+        return None
+
+
+def generate_structured(
+    llm_config,
+    user_input: str,
+    schema: str,
+    system_prompt: str,
+    max_tokens: int = 512,
+    temperature: float = 0.0,
+    stop= None,
+) -> dict | None:
+
+    prompt = f"""{system_prompt}
+
+CRITICAL INSTRUCTIONS:
+1. Respond with ONLY valid JSON.
+2. No explanations, no markdown, no extra text before or after the JSON.
+3. Start your response with {{ and end with }}.
+4. Use only the retrieved context provided by the user request.
+5. If the answer is not supported by the context, set "answer" to "I don't know."
+
+Schema you must follow:
+{schema}
+
+User request:
+{user_input}
+
+Response (JSON only):"""
+
+    for attempt in range(3):
+        response = call_llm_text(llm_config=llm_config,prompt=prompt,max_tokens=max_tokens,temperature=temperature,stop=stop)
+        parsed = extract_json_from_text(response)
+        if parsed is not None:
+            return parsed
+
+    return None
+
+
+def answer_rag_structured(
+    llm_config,
+    user_input: str,
+    retrieved_docs,
+    system_prompt: str,
+    schema: str = RAG_ANSWER_SCHEMA,
+    max_tokens: int = 512,
+    temperature: float = 0.0,):
+    context = "\n\n".join(
+        f"File name: {doc.metadata.get('file_name')}\n"
+        f"Source: {doc.metadata.get('source')}\n"
+        f"Content:\n{doc.page_content}"
+        for doc in retrieved_docs
+    )
+
+    structured_user_input = f"""Question:
+{user_input}
+
+Retrieved context:
+{context}
+
+Instructions:
+- Answer using only the retrieved context.
+- Do not use outside knowledge.
+- If the retrieved context does not explicitly answer the question, set "answer" to "I don't know."
+- Put source file names in "evidence_files".
+- Use "confidence" as high, medium, or low.
+- If context is insufficient, explain what is missing in "missing_information".
+"""
+
+    return generate_structured(
+        llm_config=llm_config,
+        user_input=structured_user_input,
+        schema=schema,
+        system_prompt=system_prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+
+###################
+# DECISION-MAKING #
+###################
+def decide(llm_config, system_prompt:str, user_input:str, choices: list[str],
+           max_tokens:int=512,temperature:float=0.0, stop:List[str]=["<|eot_id|>","User:"])->str | None:
+    options = "\n".join(f"- {choice}" for choice in choices)
+    prompt = f"""{system_prompt}
+You must choose ONE of the following options. Respond with ONLY valid JSON.
+
+CRITICAL INSTRUCTIONS:
+1. Response with ONLY valid JSON
+2. No explanations, no markdown, no other text
+3. Start your response with {{ and end with }}
+
+Available choices:
+{options}
+
+Required JSON format:
+{{"decision": "one_of_the_choices_above"}}
+
+User request: {user_input}
+
+Response (JSON only):"""
+
+    for attempt in range(3):
+        response = call_llm_text(llm_config=llm_config,prompt=prompt,
+                                 max_tokens=max_tokens,temperature=temperature,
+                                 stop=stop,)
+        parsed = extract_json_from_text(response)
+        if parsed and "decision" in parsed:
+            decision = parsed["decision"]
+            if decision in choices:
+                return decision
+    return None
+
+#########
+# TOOLS #
+#########
+def request_tool(llm_config, system_prompt:str, user_input:str, choices:list[str]=TOOL_CHOICES,max_tokens:int=512,temperature:float=0.0,
+                 stop:list[str]=["<|eot_id|>", "<|end_of_text|>", "\nUser request:", "\nInput:"])->dict|None:
+    options = "\n".join(f"- {choice}" for choice in choices)
+    prompt=f"""{system_prompt}
+
+You are a tool-calling assistant. When asked a math question, you must respond with ONLY valid JSON.
+
+Available tools: {options}
+
+Tool guidance:
+- calculator: use for arithmetic/math calculations
+- search_docs: use when the user asks to find information in documents
+- summarize_docs: use when the user asks to summarize documents
+- answer_from_docs: use when the user asks a question that should be answered from retrieved documents
+- none: use when no tool is needed
+
+CRITICAL INSTRUCTIONS:
+1. Respond with ONLY valid JSON
+2. No explanations, no markdown, no other text
+3. Start your response with {{ and end with }}
+
+Example output format:
+{{"tool": "calculator", "arguments": {{"a": 42, "b": 7, "operation": "divide"}}}}
+
+User request: {user_input}
+
+Response (JSON only):"""
+    for attempt in range(3):
+        response=call_llm_text(llm_config=llm_config,prompt=prompt,
+                               max_tokens=max_tokens,temperature=temperature,
+                               stop=stop,)
+        parsed=extract_json_from_text(response)
+        if parsed and "tool" in parsed and "arguments" in parsed:
+            return parsed
+    return None
+
+def execute_tool_call(llm_config,tool_call:dict)->Any:
+    return execute_tool(tool_call["tool"],tool_call["arguments"])
+
+#########
+# LOOPS #
+#########
+def agent_step(llm_config, state: AgentState, system_prompt:str, user_input:str,
+               max_tokens:int=512,temperature:float=0.0)-> dict | None:
+    state_dict=state.to_dict()
+    prompt=f"""{system_prompt}
+
+You are an agent. You must decide the next action and respond with ONLY valid JSON.
+
+Current state: steps = {state_dict.get('steps', 0)}, done = {state_dict.get('done', False)}
+
+Available actions: analyze, research, summarize, answer, done
+
+CRITICAL INSTRUCTIONS:
+1. Respond with ONLY valid JSON
+2. No explanations, no markdown, no other text
+3. Start your response with {{ and end with }}
+
+Required JSON format:
+{{"action": "action_name", "reason": "explanation"}}
+
+User input: {user_input}
+
+Response (JSON only):"""
+
+    for attempt in range(3):
+        response = call_llm_text(llm_config=llm_config, prompt=prompt,
+                                 max_tokens=max_tokens, temperature=temperature,
+                                 stop=stop)
+        parsed = extract_json_from_text(response)
+        if parsed and "action" in parsed:
+            if "reason" not in parsed:
+                parsed["reason"] = f"Taking action: {parsed['action']}"
+            state.increment_step()
+            return parsed
+    return None
+
+def run_loop(llm_config, system_prompt:str, user_input:str, temperature:float=0.0,
+             max_steps:int=5):
+    state=AgentState()
+    state.reset()
+    results=[]
+    while not state.done and state.steps<max_steps:
+        action = agent_step(llm_config, state,system_prompt, user_input, temperature)
+        if action:
+            results.append(action)
+            if action.get("action")=="done":
+                state.mark_done()
+        else:
+            break
+    return results
 
 if __name__ == "__main__":
     main()
