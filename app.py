@@ -29,6 +29,7 @@ import numpy as np
 from langchain_core.load import dumps, loads
 
 from typing import Any, List, Optional
+import shutil
 
 
 model_path = str(Path.home() / "Desktop" / "agents-from-scratch" / "models" / "llama-3-8b-instruct.gguf")
@@ -82,6 +83,10 @@ TOOL_CHOICES = [
     "none",
 ]
 
+CHROMA_DIR = Path("chroma_db")
+CHROMA_COLLECTION = "ufund_docs"
+EMBEDDING_MODEL = "text-embedding-3-small"
+
 class AgentState:
     def __init__(self):
         self.steps=0
@@ -107,6 +112,7 @@ def main() -> None:
     export_drive=args.export_drive
     llm_provider=args.llm_provider
     openai_model=args.openai_model
+    reindex=args.reindex
 
     system_prompt=("You are an assistant who truthfully and thoughtfully answers questions the members of UFund Investment LLC have.")
 
@@ -126,111 +132,117 @@ Response:"""
         "stop": stop if stop is not None else ["<|eot_id|>","User:"],
     }
     
-    #load gdrive files
-    if export_drive:
-        service=get_drive_service()
-        exported,downloaded,skipped=export_folder(
-            service=service,
-            folder_id=FOLDER_ID,
-            output_dir=OUTPUT_DIR,
+    DOCS_PATH = str(OUTPUT_DIR)
+
+    if export_drive and not reindex:
+        raise ValueError(
+            "--export-drive must be used together with --reindex."
+        )
+
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError(
+            "Missing OPENAI_API_KEY. "
+            "It is required for OpenAIEmbeddings."
+        )
+
+    embeddings = OpenAIEmbeddings(
+        model=EMBEDDING_MODEL
+    )
+
+    if not reindex and not CHROMA_DIR.exists():
+        raise RuntimeError(
+            "No Chroma database exists. "
+            "Run with --reindex first."
+        )
+
+    splits = None
+
+    #TODO: Could extract the reindex logic to a separate function
+    #TODO: Can we allow reindex independently such that one can just do reindex of documents instead of running LLM together with it? 
+    if reindex:
+        if export_drive:
+            service = get_drive_service()
+
+            exported, downloaded, skipped = export_folder(
+                service=service,
+                folder_id=FOLDER_ID,
+                output_dir=OUTPUT_DIR,
             )
 
-    #indexing files
-    DOCS_PATH="exported_docs_for_rag"
-    docs,skipped_files=indexing(DOCS_PATH)
+            print("Exported:", len(exported))
+            print("Downloaded:", len(downloaded))
+            print("Skipped during export:", len(skipped))
 
+        docs, skipped_files = indexing(
+            DOCS_PATH,
+            printing=True,
+        )
+
+        if not docs:
+            raise RuntimeError(
+                f"No supported documents found in {DOCS_PATH}."
+            )
+
+        text_splitter = (
+            RecursiveCharacterTextSplitter
+            .from_tiktoken_encoder(
+                chunk_size=300,
+                chunk_overlap=50,
+            )
+        )
+
+        splits = text_splitter.split_documents(docs)
+
+        if not splits:
+            raise RuntimeError(
+                "Documents were loaded, but no chunks were created."
+            )
+
+        if CHROMA_DIR.exists():
+            shutil.rmtree(CHROMA_DIR)
+
+    vectorstore = Chroma(
+        collection_name=CHROMA_COLLECTION,
+        persist_directory=str(CHROMA_DIR),
+        embedding_function=embeddings,
+    )
+
+    if reindex:
+        vectorstore.add_documents(splits)
+
+        print(
+            f"Indexed {len(splits)} chunks into "
+            f"{CHROMA_DIR.resolve()}."
+        )
+        
+        if not user_input:
+            return
+
+    if not user_input:
+        raise ValueError(
+            "--prompt is required unless you are using --reindex."
+        )
     
-    #getting llm
-    llm_config=build_llm(llm_provider=llm_provider,model_path=model_path,
-                         n_ctx=n_ctx,temperature=temperature,openai_model=openai_model)
+    llm_config = build_llm(
+        llm_provider=llm_provider,
+        model_path=model_path,
+        n_ctx=n_ctx,
+        temperature=temperature,
+        openai_model=openai_model,
+    )
 
-    #embedder
-    #embd = OpenAIEmbeddings()
-
-    #split documents into chunks
-    text_splitter=RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-        chunk_size=300,
-        chunk_overlap=50,
-        )
-    splits = text_splitter.split_documents(docs)
-    #print("Splits:", len(splits))
-
-    #embed and store chunks in chroma
-    vectorstore=Chroma.from_documents(
-        documents=splits,
-        #embedding=OpenAIEmbeddings(),
-        )
-
-    #retrieve docs
-    retriever=vectorstore.as_retriever(
-        search_kwargs={"k":4}
-        )
-    retrieved_docs=retriever.invoke(user_input) 
-
-    #answer FOR OPENAI
-    '''answer_chain = prompt | llm | StrOutputParser()
-    
-    TRACE_DIR = Path("local_traces")
-    TRACE_DIR.mkdir(exist_ok=True)
-
-    answer, retrieved_docs = run_rag_with_local_trace(user_input)
-    print("ANSWER:")
-    print(answer)
-    print()
-    print("RETRIEVED DOCS:")
-    for i, doc in enumerate(retrieved_docs):
-        print("RESULT", i)
-        print(doc.metadata)
-        print(doc.page_content[:500])
-        print()'''
-
-    #LOCAL LLM ANSWER
-    '''answer=answer_with_local_llm(
-        llm=llm,
-        user_input=user_input,
-        retrieved_docs=retrieved_docs,
-        system_prompt=system_prompt,
-        max_tokens=max_tokens,
-        temperature=temperature
-        )
-    print(answer)'''
-
-    #structured output
-    structured_answer = answer_rag_structured(
+    agent_result = run_loop(
         llm_config=llm_config,
-        user_input=user_input,
-        retrieved_docs=retrieved_docs,
         system_prompt=system_prompt,
+        user_input=user_input,
+        vectorstore=vectorstore,
+        max_steps=max_steps,
         max_tokens=max_tokens,
         temperature=temperature,
     )
+    print(json.dumps(agent_result, indent=2, ensure_ascii=False))
 
-    if structured_answer is None:
-        print("Model failed to return valid JSON.")
-    else:
-        print(json.dumps(structured_answer, indent=2, ensure_ascii=False))
-
-    #decide() test
-    choices=["answer_from_context","not_enough_context"]
-    decide_test=decide(llm_config=llm_config,system_prompt=system_prompt,
-                       user_input=user_input,choices=choices,)
-    print("Decide test:", decide_test)
-
-    #tool test
-    tool_test=request_tool(llm_config=llm_config,system_prompt=system_prompt,
-                           user_input=user_input)
-
-    #loops
-    results=run_loop(llm_config,system_prompt,user_input)
-    for i, result in enumerate(results,1):
-        print(f"Iteration {i}:")
-        action = result.get("action","unknown")
-        reason = result.get("reason","No reason provided")
-        print(f"  Action: {action}")
-        print(f"  Reason: {reason}")
-        if i < len(results):
-            print()
-
+'''
     #multi query
     template = """You are an AI language modle assistant. Your task is to generate
 five different versions of the given user question to retrieve relevant documents
@@ -247,14 +259,14 @@ Original question: {question}"""
         )
     retrieval_chain = generate_queries | retriever.map() | get_unique_union
     docs = retrieval_chain.invoke({"question":user_input})
-    #print(len(docs))
+    #print(len(docs))'''
 
 ##############
 # PARSE ARGS #
 ##############
 def parse_args():
     parser=argparse.ArgumentParser()
-    parser.add_argument("--prompt", required=True)
+    parser.add_argument("--prompt", help="Question to ask the agent.")
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0)
     parser.add_argument("--n-ctx",type=int,default=2048)
@@ -262,6 +274,7 @@ def parse_args():
     parser.add_argument("--export-drive", action="store_true")
     parser.add_argument("--llm-provider", choices=["local","openai"],default="local",)
     parser.add_argument("--openai-model", default="gpt-3.5-turbo",)
+    parser.add_argument("--reindex", action="store_true")
     return parser.parse_args()
 
 ###############
@@ -432,14 +445,18 @@ def indexing(DOCS_PATH,printing=False):
             if suffix in ['.txt', '.md']:
                 loader=TextLoader(str(path),encoding='utf-8')
             elif suffix == '.pdf':
-                loader=pyPDFLoader(str(path))
+                loader = PyPDFLoader(str(path))
             elif suffix=='.docx':
                 loader=Docx2txtLoader(str(path))
             elif suffix=='.csv':
                 loader=CSVLoader(str(path))
             else:
-                skipped_files.append(f"{path} | unsupported file type")
-            loaded_docs=loader.load()
+                skipped_files.append(
+                    f"{path} | unsupported file type"
+                )
+                continue
+
+            loaded_docs = loader.load()
             for doc in loaded_docs:
                 doc.metadata["source"]=str(path)
                 doc.metadata["file_name"]=path.name
@@ -537,22 +554,20 @@ def get_unique_union(documents: list[list]):
 #####################
 def extract_json_from_text(text: str) -> dict | None:
     text = text.strip()
+    decoder=json.JSONDecoder()
 
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
+    for i, char in enumerate(text):
+        if char != "{":
+            continue
 
-    start = text.find("{")
-    end = text.rfind("}")
+        try:
+            parsed, _ = decoder.raw_decode(text[i:])
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            continue
 
-    if start == -1 or end == -1 or end <= start:
-        return None
-
-    try:
-        return json.loads(text[start:end+1])
-    except json.JSONDecodeError:
-        return None
+    return None
 
 
 def generate_structured(
@@ -704,36 +719,125 @@ Response (JSON only):"""
             return parsed
     return None
 
-def execute_tool_call(llm_config,tool_call:dict)->Any:
-    return execute_tool(tool_call["tool"],tool_call["arguments"])
+def execute_tool_call(tool_call:dict,vectorstore=None,)->Any:
+    tool_name=tool_call.get("tool")
+    arguments=tool_call.get("arguments",{}) or {}
+    try:
+        result=execute_tool(tool_name=tool_name,arguments=arguments,vectorstore=vectorstore,)
+        return {"tool": tool_name, "arguments": arguments, "result": result, "success": True,}
+    except Exception as e:
+        return {"tool": tool_name, "arguments": arguments, "error": str(e), "success": False,}
 
-#########
-# LOOPS #
-#########
-def agent_step(llm_config, state: AgentState, system_prompt:str, user_input:str,
-               max_tokens:int=512,temperature:float=0.0)-> dict | None:
-    state_dict=state.to_dict()
+def search_docs(vectorstore, query: str, k: int = 4):
+    retrieved_docs = vectorstore.similarity_search(
+        query,
+        k=k,
+    )
+    results=[]
+    for doc in retrieved_docs:
+        results.append({
+            "file_name": doc.metadata.get("file_name"),
+            "source": doc.metadata.get("source"),
+            "file_type": doc.metadata.get("file_type"),
+            "content": doc.page_content,
+            })
+    return results
+
+def summarize_docs(vectorstore, limit:int=5):
+    stored_data = vectorstore.get(
+        include=["metadatas"]
+    )
+    metadatas = stored_data.get("metadatas") or []
+    file_names=sorted({metadata.get("file_name", "unknown") for metadata in metadatas if metadata})
+    return {
+        "available_files": file_names[:limit],
+        "file_count": len(file_names)
+        }
+
+def execute_tool(tool_name: str, arguments: dict, vectorstore=None):
+    #TODO: Can we provide the tools using a dictionary? e.g. {'search_docs': search_docs}, so here one can just use too_dict.get(tool_name)
+    if tool_name=="search_docs":
+        if vectorstore is None:
+            raise ValueError("vectorstore is required for search_docs")
+        return search_docs(vectorstore=vectorstore, query=arguments.get("query",""),
+                           k=int(arguments.get("k",4)),
+                           )
+    if tool_name=="summarize_docs":
+        if vectorstore is None:
+            raise ValueError("vectorstore is required for summarize_docs")
+        return summarize_docs(vectorstore=vectorstore, limit=int(arguments.get("limit",5)),)
+    if tool_name=="none":
+        return "No tool used."
+    raise ValueError(f"Unknown tool: {tool_name}")
+
+########
+# LOOP #
+########
+def render_messages(messages: list[dict])->str:
+    lines=[]
+    for message in messages:
+        role = message.get("role", "unknown")
+        content = message.get("content","")
+        lines.append(f"{role.upper()}:\n{content}")
+    return "\n\n".join(lines)
+
+def agent_step(llm_config, messages:list[dict], system_prompt:str,
+               max_tokens:int=128,temperature:float=0.0,
+                   stop=["<|eot_id|>", "<|end_of_text|>", "\n#", "\n\n"])-> dict | None:
+    conversation=render_messages(messages)
+    has_tool_result = any(message.get("role") == "tool" for message in messages)
+    tool_status = (#TODO: What if there's new tool which is not document-search? should we change the prompt when that happens? 
+        "A document-search result is already available. "
+        "You MUST now return final_answer. "
+        "Do not request another tool."
+        if has_tool_result
+        else
+        "No document-search result is available. "
+        "You must request search_docs before answering."
+    )
+
+    #TODO: Can we use the tool dictionary here for "Available tools" instead of hardcoding? 
     prompt=f"""{system_prompt}
 
-You are an agent. You must decide the next action and respond with ONLY valid JSON.
+You are an agent that can either answer directly or request a tool.
 
-Current state: steps = {state_dict.get('steps', 0)}, done = {state_dict.get('done', False)}
+Available tools:
+1. search_docs
+   - Use when the user asks about information that may be inside company documents.
+   - Arguments: {{"query": "search query", "k": 4}}
 
-Available actions: analyze, research, summarize, answer, done
+2. summarize_docs
+   - Use when the user asks what files/documents are available.
+   - Arguments: {{"limit": 5}}
+
+3. none
+   - Use when no tool is needed.
 
 CRITICAL INSTRUCTIONS:
-1. Respond with ONLY valid JSON
-2. No explanations, no markdown, no other text
-3. Start your response with {{ and end with }}
+1. Respond with ONLY valid JSON.
+2. No markdown, no extra text.
+3. Start with {{ and end with }}.
+4. Do not use outside knowledge for company-document questions.
+5. If you need information from documents, request search_docs first.
+6. If you have enough information, return final_answer.
+7. After one tool result is available, you must return final_answer.
+8. Never call search_docs more than once for the same user request.
 
-Required JSON format:
-{{"action": "action_name", "reason": "explanation"}}
+Tool status:
+{tool_status}
 
-User input: {user_input}
+Required JSON formats:
+- For tool use:
+{{"action": "tool_use", "tool": "search_docs", "arguments": {{"query": "Egnyte", "k": 4}}, "reason": "Need to search company documents."}}
+- For final answer:
+{{"action": "final_answer", "answer": "your answer here", "reason": "why this answer is supported"}}
+
+Conversation so far:
+{conversation}
 
 Response (JSON only):"""
 
-    for attempt in range(3):
+    for attempt in range(3): #TODO: Why there's a loop here? what's the relationship with the outside for-loop
         response = call_llm_text(llm_config=llm_config, prompt=prompt,
                                  max_tokens=max_tokens, temperature=temperature,
                                  stop=stop)
@@ -741,24 +845,73 @@ Response (JSON only):"""
         if parsed and "action" in parsed:
             if "reason" not in parsed:
                 parsed["reason"] = f"Taking action: {parsed['action']}"
-            state.increment_step()
             return parsed
     return None
 
-def run_loop(llm_config, system_prompt:str, user_input:str, temperature:float=0.0,
-             max_steps:int=5):
-    state=AgentState()
-    state.reset()
-    results=[]
-    while not state.done and state.steps<max_steps:
-        action = agent_step(llm_config, state,system_prompt, user_input, temperature)
-        if action:
-            results.append(action)
-            if action.get("action")=="done":
-                state.mark_done()
-        else:
-            break
-    return results
+def run_loop(llm_config, system_prompt:str, user_input:str, vectorstore=None,
+             max_tokens:int=512,temperature:float=0.0,max_steps:int=5):
+    messages=[
+        {
+            "role": "user",
+            "content": user_input,
+            }
+        ]
+    steps=[]
+    for step_number in range(1, max_steps+1):
+        #TODO: add logging for the messages used in each step, you can log into a file
+        step=agent_step(llm_config=llm_config,messages=messages,system_prompt=system_prompt,
+                        max_tokens=max_tokens,temperature=temperature,)
+        if step is None:
+            return {
+                "answer": "I don't know",
+                "steps": steps,
+                "error": "Agent failed to return valid JSON."
+                }
+        steps.append(step)
+        action=step.get("action")
+        #TODO: change has_tool_result to a better name
+        has_tool_result = any(message.get("role") == "tool" for message in messages)
+        if action == "final_answer" and not has_tool_result:
+            #TODO: Add comment for what are we doing here and why? 
+            step = {
+                "action": "tool_use",
+                "tool": "search_docs",
+                "arguments": {
+                    "query": user_input,
+                    "k": 4,
+                },
+                "reason": "A document search is required before answering.",
+            }
+            action = "tool_use"
+        if action == "final_answer":
+            return {
+                "answer": step.get("answer", "I don't know."),
+                "steps": steps,
+                }
+        if action=="tool_use":
+            tool_result = execute_tool_call(
+                tool_call=step,
+                vectorstore=vectorstore,
+            )
+            messages.append({
+                "role": "assistant",
+                "content": json.dumps(step,ensure_ascii=False),
+                })
+            messages.append({
+                "role": "tool",
+                "content": json.dumps(tool_result, ensure_ascii=False),
+                })
+            continue
+        return {
+            "answer": "I don't know.",
+            "steps": steps,
+            "error": f"Unknown action: {action}",
+            }
+    return {
+        "answer": "I don't know.",
+        "steps": steps,
+        "error": "Reached max_steps before final answer.",
+        }
 
 if __name__ == "__main__":
     main()
