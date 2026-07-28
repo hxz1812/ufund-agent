@@ -28,8 +28,14 @@ import tiktoken
 import numpy as np
 from langchain_core.load import dumps, loads
 
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Callable
 import shutil
+
+from openpyxl import load_workbook
+from langchain_core.documents import Document
+
+import hashlib
+import math
 
 
 model_path = str(Path.home() / "Desktop" / "agents-from-scratch" / "models" / "llama-3-8b-instruct.gguf")
@@ -41,7 +47,23 @@ SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 FOLDER_ID = "1OqyC8z5ECyFALzjpQLE-vaNyNI5T2ey0"
 
-OUTPUT_DIR = Path("exported_docs_for_rag")
+BASE_DIR = Path(__file__).resolve().parent
+
+ENV_PATH = BASE_DIR / ".env"
+OUTPUT_DIR = BASE_DIR / "exported_docs_for_rag"
+CHROMA_DIR = BASE_DIR / "chroma_db"
+
+CHROMA_COLLECTION = "ufund_docs"
+EMBEDDING_MODEL = "text-embedding-3-small"
+
+REINDEX_STATE_PATH = (
+    Path(__file__).resolve().parent
+    / "reindex_state.json"
+)
+
+INDEX_BATCH_SIZE = 1000
+CHUNK_SIZE = 300
+CHUNK_OVERLAP = 50
 
 
 GOOGLE_EXPORT_TYPES = {
@@ -63,7 +85,6 @@ GOOGLE_EXPORT_TYPES = {
     },
 }
 
-ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
 RAG_ANSWER_SCHEMA = """
@@ -83,23 +104,44 @@ TOOL_CHOICES = [
     "none",
 ]
 
-CHROMA_DIR = Path("chroma_db")
-CHROMA_COLLECTION = "ufund_docs"
-EMBEDDING_MODEL = "text-embedding-3-small"
+DROPBOX_DIR_TEXT = os.getenv("DROPBOX_DIR")
 
-class AgentState:
-    def __init__(self):
-        self.steps=0
-        self.done=False
-    def reset(self):
-        self.steps=0
-        self.done=False
-    def increment_step(self):
-        self.steps+=1
-    def mark_done(self):
-        self.done=True
-    def to_dict(self):
-        return {"steps": self.steps, "done": self.done}
+DROPBOX_DIR = (
+    Path(DROPBOX_DIR_TEXT).expanduser()
+    if DROPBOX_DIR_TEXT
+    else None
+)
+
+ToolHandler = Callable[[dict, Any], Any]
+
+TOOL_REGISTRY = {
+    "search_docs": {
+        "description": (
+            "Search company documents for information "
+            "relevant to the user's question."
+        ),
+        "arguments": {
+            "query": "string",
+            "k": "integer, default 4",
+        },
+        "handler": execute_search_docs,
+    },
+    "summarize_docs": {
+        "description": (
+            "List or summarize the documents available "
+            "in the vector database."
+        ),
+        "arguments": {
+            "limit": "integer, default 5",
+        },
+        "handler": execute_summarize_docs,
+    },
+    "none": {
+        "description": "Use when no tool is required.",
+        "arguments": {},
+        "handler": execute_none,
+    },
+}
 
 def main() -> None:
     args = parse_args()
@@ -115,24 +157,6 @@ def main() -> None:
     reindex=args.reindex
 
     system_prompt=("You are an assistant who truthfully and thoughtfully answers questions the members of UFund Investment LLC have.")
-
-    prompt = f"""{system_prompt}
-
-CRITICAL INSTRUCTIONS:
-1. Everything in your response will have evidence to support it from given documents and text.
-2. If you cannot find evidence or facts, you will respond with "I don't know."
-
-User request: {user_input}
-
-Response:"""
-
-    kwargs = {
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "stop": stop if stop is not None else ["<|eot_id|>","User:"],
-    }
-    
-    DOCS_PATH = str(OUTPUT_DIR)
 
     if export_drive and not reindex:
         raise ValueError(
@@ -155,74 +179,25 @@ Response:"""
             "Run with --reindex first."
         )
 
-    splits = None
-
-    #TODO: Could extract the reindex logic to a separate function
-    #TODO: Can we allow reindex independently such that one can just do reindex of documents instead of running LLM together with it? 
     if reindex:
-        if export_drive:
-            service = get_drive_service()
-
-            exported, downloaded, skipped = export_folder(
-                service=service,
-                folder_id=FOLDER_ID,
-                output_dir=OUTPUT_DIR,
-            )
-
-            print("Exported:", len(exported))
-            print("Downloaded:", len(downloaded))
-            print("Skipped during export:", len(skipped))
-
-        docs, skipped_files = indexing(
-            DOCS_PATH,
-            printing=True,
+        vectorstore = reindex_documents(
+            embeddings=embeddings,
+            export_drive=export_drive,
         )
-
-        if not docs:
-            raise RuntimeError(
-                f"No supported documents found in {DOCS_PATH}."
-            )
-
-        text_splitter = (
-            RecursiveCharacterTextSplitter
-            .from_tiktoken_encoder(
-                chunk_size=300,
-                chunk_overlap=50,
-            )
-        )
-
-        splits = text_splitter.split_documents(docs)
-
-        if not splits:
-            raise RuntimeError(
-                "Documents were loaded, but no chunks were created."
-            )
-
-        if CHROMA_DIR.exists():
-            shutil.rmtree(CHROMA_DIR)
-
-    vectorstore = Chroma(
-        collection_name=CHROMA_COLLECTION,
-        persist_directory=str(CHROMA_DIR),
-        embedding_function=embeddings,
-    )
-
-    if reindex:
-        vectorstore.add_documents(splits)
-
-        print(
-            f"Indexed {len(splits)} chunks into "
-            f"{CHROMA_DIR.resolve()}."
-        )
-        
         if not user_input:
             return
+    else:
+        vectorstore = Chroma(
+            collection_name=CHROMA_COLLECTION,
+            persist_directory=str(CHROMA_DIR),
+            embedding_function=embeddings,
+        )
 
     if not user_input:
         raise ValueError(
             "--prompt is required unless you are using --reindex."
         )
-    
+
     llm_config = build_llm(
         llm_provider=llm_provider,
         model_path=model_path,
@@ -434,34 +409,113 @@ def export_folder(service,folder_id,output_dir,relative_path=""):
 ############
 # INDEXING #
 ############
-def indexing(DOCS_PATH,printing=False):
+def load_xlsx_documents(path: Path, rows_per_document: int = 50,) -> list[Document]:
+    workbook = load_workbook(
+        filename=path,
+        read_only=True,
+        data_only=True,
+    )
+    documents = []
+
+    try:
+        for worksheet in workbook.worksheets:
+            batch_lines = []
+            batch_start_row = None
+            for row_number, row in enumerate(
+                worksheet.iter_rows(values_only=True),
+                start=1,
+            ):
+                values = [
+                    "" if value is None else str(value)
+                    for value in row
+                ]
+                
+                if not any(value.strip() for value in values):
+                    continue
+                if batch_start_row is None:
+                    batch_start_row = row_number
+                batch_lines.append("\t".join(values))
+                if len(batch_lines) >= rows_per_document:
+                    documents.append(
+                        Document(
+                            page_content=(
+                                f"Worksheet: {worksheet.title}\n"
+                                f"Rows: {batch_start_row}-{row_number}\n\n"
+                                + "\n".join(batch_lines)
+                            ),
+                            metadata={
+                                "sheet_name": worksheet.title,
+                                "row_start": batch_start_row,
+                                "row_end": row_number,
+                            },
+                        )
+                    )
+                    batch_lines = []
+                    batch_start_row = None
+            if batch_lines:
+                documents.append(
+                    Document(
+                        page_content=(
+                            f"Worksheet: {worksheet.title}\n"
+                            f"Rows: {batch_start_row}-{worksheet.max_row}\n\n"
+                            + "\n".join(batch_lines)
+                        ),
+                        metadata={
+                            "sheet_name": worksheet.title,
+                            "row_start": batch_start_row,
+                            "row_end": worksheet.max_row,
+                        },
+                    )
+                )
+    finally:
+        workbook.close()
+    return documents
+
+def load_documents(DOCS_PATH,printing=False,source_system="local"):
     docs=[]
     skipped_files=[]
-    for path in Path(DOCS_PATH).rglob('*'):
+    root_path = Path(DOCS_PATH).expanduser().resolve()
+    for path in sorted(root_path.rglob("*")):
         if path.is_dir() or path.name.startswith('.'):
             continue
         suffix = path.suffix.lower()
         try:
-            if suffix in ['.txt', '.md']:
-                loader=TextLoader(str(path),encoding='utf-8')
-            elif suffix == '.pdf':
-                loader = PyPDFLoader(str(path))
-            elif suffix=='.docx':
-                loader=Docx2txtLoader(str(path))
-            elif suffix=='.csv':
-                loader=CSVLoader(str(path))
-            else:
-                skipped_files.append(
-                    f"{path} | unsupported file type"
+            if suffix == ".xlsx":
+                loaded_docs = load_xlsx_documents(
+                    path=path,
+                    rows_per_document=50,
                 )
-                continue
+            else:
+                if suffix in ['.txt', '.md']:
+                    loader=TextLoader(str(path),encoding='utf-8')
+                elif suffix == '.pdf':
+                    loader = PyPDFLoader(str(path))
+                elif suffix=='.docx':
+                    loader=Docx2txtLoader(str(path))
+                elif suffix=='.csv':
+                    loader=CSVLoader(str(path))
+                else:
+                    skipped_files.append(
+                        f"{path} | unsupported file type"
+                    )
+                    continue
 
-            loaded_docs = loader.load()
+                loaded_docs = loader.load()
             for doc in loaded_docs:
-                doc.metadata["source"]=str(path)
-                doc.metadata["file_name"]=path.name
-                doc.metadata["file_type"]=suffix
-                doc.page_content=f"File name: {path.name}\nSource: {path}\n\n{doc.page_content}"
+                resolved_path = path.resolve()
+                doc.metadata["source"] = str(resolved_path)
+                doc.metadata["source_system"] = source_system
+                doc.metadata["relative_path"] = str(
+                    resolved_path.relative_to(root_path)
+                )
+                doc.metadata["file_name"] = path.name
+                doc.metadata["file_type"] = suffix
+                doc.page_content = (
+                    f"File name: {path.name}\n"
+                    f"Source system: {source_system}\n"
+                    f"Source: {resolved_path}\n\n"
+                    f"{doc.page_content}"
+                )
             docs.extend(loaded_docs)
         except Exception as e:
             skipped_files.append(f"{path} | ERROR: {e}")
@@ -479,6 +533,266 @@ def indexing(DOCS_PATH,printing=False):
             for item in skipped_files[:20]:
                 print(item)
     return docs, skipped_files
+
+#checkpoint function
+def load_reindex_state() -> dict | None:
+    if not REINDEX_STATE_PATH.exists():
+        return None
+    try:
+        return json.loads(
+            REINDEX_STATE_PATH.read_text(
+                encoding="utf-8"
+            )
+        )
+    except (json.JSONDecodeError, OSError):
+        return None
+
+#checkpoint function
+def save_reindex_state(state: dict) -> None:
+    temporary_path = REINDEX_STATE_PATH.with_suffix(
+        ".json.tmp"
+    )
+    temporary_path.write_text(
+        json.dumps(
+            state,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    temporary_path.replace(REINDEX_STATE_PATH)
+
+def create_chunk_ids(splits,) -> list[str]:
+    source_chunk_numbers = {}
+    chunk_ids = []
+    for chunk in splits:
+        source_system = chunk.metadata.get(
+            "source_system",
+            "unknown",
+        )
+        source = chunk.metadata.get(
+            "source",
+            "unknown",
+        )
+        source_key = f"{source_system}|{source}"
+        chunk_number = source_chunk_numbers.get(
+            source_key,
+            0,
+        )
+        source_chunk_numbers[source_key] = (
+            chunk_number + 1
+        )
+        content_hash = hashlib.sha256(
+            chunk.page_content.encode("utf-8")
+        ).hexdigest()
+        raw_id = (
+            f"{source_key}|"
+            f"{chunk_number}|"
+            f"{content_hash}"
+        )
+        chunk_id = hashlib.sha256(
+            raw_id.encode("utf-8")
+        ).hexdigest()
+        chunk.metadata["chunk_number"] = chunk_number
+        chunk.metadata["content_hash"] = content_hash
+        chunk_ids.append(chunk_id)
+    return chunk_ids
+
+#check doc / chunk config changes
+def create_index_signature(chunk_ids: list[str]) -> str:
+    digest = hashlib.sha256()
+    digest.update(
+        EMBEDDING_MODEL.encode("utf-8")
+    )
+    digest.update(
+        str(CHUNK_SIZE).encode("utf-8")
+    )
+    digest.update(
+        str(CHUNK_OVERLAP).encode("utf-8")
+    )
+    for chunk_id in chunk_ids:
+        digest.update(
+            chunk_id.encode("utf-8")
+        )
+
+    return digest.hexdigest()
+
+def reindex_documents(embeddings, export_drive: bool = False,):
+    if export_drive:
+        service = get_drive_service()
+
+        exported, downloaded, skipped = export_folder(
+            service=service,
+            folder_id=FOLDER_ID,
+            output_dir=OUTPUT_DIR,
+        )
+
+        print("Exported:", len(exported))
+        print("Downloaded:", len(downloaded))
+        print("Skipped during export:", len(skipped))
+
+    docs = []
+    skipped_files = []
+
+    document_sources = [
+        ("google_drive", OUTPUT_DIR),
+    ]
+
+    if DROPBOX_DIR is not None:
+        if not DROPBOX_DIR.exists():
+            raise RuntimeError(
+                f"Dropbox directory does not exist: "
+                f"{DROPBOX_DIR}"
+            )
+
+        if not DROPBOX_DIR.is_dir():
+            raise RuntimeError(
+                f"DROPBOX_DIR is not a folder: "
+                f"{DROPBOX_DIR}"
+            )
+
+        document_sources.append(
+            ("dropbox", DROPBOX_DIR)
+        )
+
+    for source_system, source_path in document_sources:
+        source_path = Path(source_path).expanduser()
+
+        if not source_path.exists():
+            print(
+                f"Skipping missing document source: "
+                f"{source_system} — {source_path}"
+            )
+            continue
+
+        print(
+            f"\nLoading {source_system} documents from:"
+            f"\n{source_path.resolve()}"
+        )
+
+        source_docs, source_skipped = load_documents(
+            DOCS_PATH=source_path,
+            printing=True,
+            source_system=source_system,
+        )
+
+        docs.extend(source_docs)
+        skipped_files.extend(source_skipped)
+
+    if not docs:
+        raise RuntimeError(
+            "No supported documents were found in "
+            "Google Drive exports or Dropbox."
+        )
+
+    text_splitter = (
+        RecursiveCharacterTextSplitter
+        .from_tiktoken_encoder(
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+        )
+    )
+    splits = text_splitter.split_documents(docs)
+
+    if not splits:
+        raise RuntimeError(
+            "Documents were loaded, but no chunks were created."
+        )
+
+    chunk_ids = create_chunk_ids(splits)
+
+    index_signature = create_index_signature(
+        chunk_ids
+    )
+
+    state = load_reindex_state()
+
+    can_resume = (
+        state is not None
+        and state.get("signature") == index_signature
+        and CHROMA_DIR.exists()
+    )
+
+    if can_resume:
+        start_batch = int(
+            state.get("next_batch", 0)
+        )
+        print(
+            "Resuming interrupted reindex from "
+            f"batch {start_batch + 1}."
+        )
+
+    else:
+        if CHROMA_DIR.exists():
+            shutil.rmtree(CHROMA_DIR)
+
+        start_batch = 0
+
+        state = {
+            "signature": index_signature,
+            "next_batch": 0,
+            "total_batches": math.ceil(
+                len(splits) / INDEX_BATCH_SIZE
+            ),
+            "complete": False,
+        }
+        save_reindex_state(state)
+        print("Starting a new reindex job.")
+
+    vectorstore = Chroma(
+        collection_name=CHROMA_COLLECTION,
+        persist_directory=str(CHROMA_DIR),
+        embedding_function=embeddings,
+    )
+
+
+    total_batches = math.ceil(
+        len(splits) / INDEX_BATCH_SIZE
+    )
+
+    if state.get("complete"):
+        print(
+            "This exact document index is already complete."
+        )
+        return vectorstore
+
+    for batch_number in range(
+        start_batch,
+        total_batches,
+    ):
+        start = batch_number * INDEX_BATCH_SIZE
+        end = min(
+            start + INDEX_BATCH_SIZE,
+            len(splits),
+        )
+        batch_documents = splits[start:end]
+        batch_ids = chunk_ids[start:end]
+        print(
+            f"Indexing batch {batch_number + 1} "
+            f"of {total_batches}: "
+            f"chunks {start + 1}-{end}"
+        )
+        vectorstore.add_documents(
+            documents=batch_documents,
+            ids=batch_ids,
+        )
+        state["next_batch"] = batch_number + 1
+        save_reindex_state(state)
+        
+    state["complete"] = True
+    state["next_batch"] = total_batches
+    save_reindex_state(state)
+
+    print(
+        f"Finished indexing {len(splits)} chunks into "
+        f"{CHROMA_DIR.resolve()}."
+    )
+    print(
+        f"Skipped {len(skipped_files)} unsupported "
+        f"or failed files."
+    )
+
+    return vectorstore
 
 def num_tokens_from_string(string: str, encoding_name: str) -> int:
     encoding=tiktoken.get_encoding(encoding_name)
@@ -737,10 +1051,15 @@ def search_docs(vectorstore, query: str, k: int = 4):
     for doc in retrieved_docs:
         results.append({
             "file_name": doc.metadata.get("file_name"),
+            "source_system": doc.metadata.get("source_system"),
+            "relative_path": doc.metadata.get("relative_path"),
             "source": doc.metadata.get("source"),
             "file_type": doc.metadata.get("file_type"),
+            "sheet_name": doc.metadata.get("sheet_name"),
+            "row_start": doc.metadata.get("row_start"),
+            "row_end": doc.metadata.get("row_end"),
             "content": doc.page_content,
-            })
+        })
     return results
 
 def summarize_docs(vectorstore, limit:int=5):
@@ -755,97 +1074,189 @@ def summarize_docs(vectorstore, limit:int=5):
         }
 
 def execute_tool(tool_name: str, arguments: dict, vectorstore=None):
-    #TODO: Can we provide the tools using a dictionary? e.g. {'search_docs': search_docs}, so here one can just use too_dict.get(tool_name)
-    if tool_name=="search_docs":
-        if vectorstore is None:
-            raise ValueError("vectorstore is required for search_docs")
-        return search_docs(vectorstore=vectorstore, query=arguments.get("query",""),
-                           k=int(arguments.get("k",4)),
-                           )
-    if tool_name=="summarize_docs":
-        if vectorstore is None:
-            raise ValueError("vectorstore is required for summarize_docs")
-        return summarize_docs(vectorstore=vectorstore, limit=int(arguments.get("limit",5)),)
-    if tool_name=="none":
-        return "No tool used."
-    raise ValueError(f"Unknown tool: {tool_name}")
+    #TODO: Can we provide the tools using a dictionary? e.g. {'search_docs': search_docs}, so here one can just use tool_dict.get(tool_name)
+    tool_handler = TOOL_REGISTRY.get(tool_name)
+    if tool_handler is None:
+        raise ValueError(
+            f"Unknown tool: {tool_name}"
+        )
+
+    return tool_handler(
+        arguments=arguments,
+        vectorstore=vectorstore,
+    )
+
+def execute_search_docs(arguments: dict, vectorstore,):
+    if vectorstore is None:
+        raise ValueError(
+            "vectorstore is required for search_docs"
+        )
+
+    return search_docs(
+        vectorstore=vectorstore,
+        query=arguments.get("query", ""),
+        k=int(arguments.get("k", 4)),
+    )
+
+
+def execute_summarize_docs(arguments: dict, vectorstore,):
+    if vectorstore is None:
+        raise ValueError(
+            "vectorstore is required for summarize_docs"
+        )
+
+    return summarize_docs(
+        vectorstore=vectorstore,
+        limit=int(arguments.get("limit", 5)),
+    )
+
+
+def execute_none(arguments: dict, vectorstore,):
+    return "No tool used."
+
 
 ########
 # LOOP #
 ########
 def render_messages(messages: list[dict])->str:
-    lines=[]
+    rendered_messages = []
+
     for message in messages:
         role = message.get("role", "unknown")
-        content = message.get("content","")
-        lines.append(f"{role.upper()}:\n{content}")
-    return "\n\n".join(lines)
+        name = message.get("name")
+        content = message.get("content", "")
+
+        if not isinstance(content, str):
+            content = json.dumps(
+                content,
+                ensure_ascii=False,
+            )
+
+        role_label = role.upper()
+
+        if name:
+            role_label += f" ({name})"
+
+        rendered_messages.append(
+            f"{role_label}:\n{content}"
+        )
+
+    return "\n\n".join(rendered_messages)
+
+def render_tool_descriptions() -> str:
+    sections = []
+
+    for index, (tool_name, spec) in enumerate(
+        TOOL_REGISTRY.items(),
+        start=1,
+    ):
+        arguments_json = json.dumps(
+            spec["arguments"],
+            ensure_ascii=False,
+        )
+
+        sections.append(
+            f"{index}. {tool_name}\n"
+            f"   - {spec['description']}\n"
+            f"   - Arguments: {arguments_json}"
+        )
+
+    return "\n\n".join(sections)
 
 def agent_step(llm_config, messages:list[dict], system_prompt:str,
                max_tokens:int=128,temperature:float=0.0,
                    stop=["<|eot_id|>", "<|end_of_text|>", "\n#", "\n\n"])-> dict | None:
-    conversation=render_messages(messages)
-    has_tool_result = any(message.get("role") == "tool" for message in messages)
-    tool_status = (#TODO: What if there's new tool which is not document-search? should we change the prompt when that happens? 
-        "A document-search result is already available. "
-        "You MUST now return final_answer. "
-        "Do not request another tool."
-        if has_tool_result
-        else
-        "No document-search result is available. "
-        "You must request search_docs before answering."
-    )
+    conversation = render_messages(messages)
+    available_tools = render_tool_descriptions()
 
-    #TODO: Can we use the tool dictionary here for "Available tools" instead of hardcoding? 
-    prompt=f"""{system_prompt}
+    tool_messages = [
+        message
+        for message in messages
+        if message.get("role") == "tool"
+    ]
 
-You are an agent that can either answer directly or request a tool.
+    if tool_messages:
+        last_tool_name = tool_messages[-1].get(
+            "name",
+            "unknown",
+        )
+        tool_status = (
+            f"A result from the '{last_tool_name}' tool "
+            "is available. Use it when deciding the next "
+            "action. Call another tool only when necessary."
+        )
+    else:
+        tool_status = (
+            "No tool result is available yet. "
+            "Select an appropriate tool when needed."
+        )
+
+    prompt = f"""{system_prompt}
+
+You are an agent that may request a tool or return a final answer.
 
 Available tools:
-1. search_docs
-   - Use when the user asks about information that may be inside company documents.
-   - Arguments: {{"query": "search query", "k": 4}}
-
-2. summarize_docs
-   - Use when the user asks what files/documents are available.
-   - Arguments: {{"limit": 5}}
-
-3. none
-   - Use when no tool is needed.
+{available_tools}
 
 CRITICAL INSTRUCTIONS:
 1. Respond with ONLY valid JSON.
-2. No markdown, no extra text.
-3. Start with {{ and end with }}.
+2. Do not include markdown or explanatory text outside JSON.
+3. Use only tools listed under Available tools.
 4. Do not use outside knowledge for company-document questions.
-5. If you need information from documents, request search_docs first.
-6. If you have enough information, return final_answer.
-7. After one tool result is available, you must return final_answer.
-8. Never call search_docs more than once for the same user request.
+5. Use existing tool results before requesting another tool.
+6. Return final_answer when sufficient information is available.
 
 Tool status:
 {tool_status}
 
 Required JSON formats:
-- For tool use:
-{{"action": "tool_use", "tool": "search_docs", "arguments": {{"query": "Egnyte", "k": 4}}, "reason": "Need to search company documents."}}
-- For final answer:
-{{"action": "final_answer", "answer": "your answer here", "reason": "why this answer is supported"}}
 
-Conversation so far:
+For tool use:
+{{"action": "tool_use", "tool": "tool_name", "arguments": {{}}, "reason": "why the tool is needed"}}
+
+For final answer:
+{{"action": "final_answer", "answer": "answer text", "reason": "why the answer is supported"}}
+
+Conversation:
 {conversation}
 
 Response (JSON only):"""
 
-    for attempt in range(3): #TODO: Why there's a loop here? what's the relationship with the outside for-loop
-        response = call_llm_text(llm_config=llm_config, prompt=prompt,
-                                 max_tokens=max_tokens, temperature=temperature,
-                                 stop=stop)
+    stop_sequences = stop or [
+        "<|eot_id|>",
+        "<|end_of_text|>",
+        "\n#",
+    ]
+
+    for attempt in range(max_parse_attempts):
+        response = call_llm_text(
+            llm_config=llm_config,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stop=stop_sequences,
+        )
         parsed = extract_json_from_text(response)
-        if parsed and "action" in parsed:
-            if "reason" not in parsed:
-                parsed["reason"] = f"Taking action: {parsed['action']}"
-            return parsed
+        if not parsed:
+            continue
+        action = parsed.get("action")
+        if action == "tool_use":
+            tool_name = parsed.get("tool")
+            if tool_name not in TOOL_REGISTRY:
+                continue
+            if not isinstance(parsed.get("arguments"), dict,):
+                continue
+        elif action == "final_answer":
+            if not isinstance(parsed.get("answer"), str,):
+                continue
+        else:
+            continue
+        parsed.setdefault(
+            "reason",
+            f"Taking action: {action}",
+        )
+        return parsed
+    
     return None
 
 def run_loop(llm_config, system_prompt:str, user_input:str, vectorstore=None,
@@ -870,8 +1281,8 @@ def run_loop(llm_config, system_prompt:str, user_input:str, vectorstore=None,
         steps.append(step)
         action=step.get("action")
         #TODO: change has_tool_result to a better name
-        has_tool_result = any(message.get("role") == "tool" for message in messages)
-        if action == "final_answer" and not has_tool_result:
+        has_tool_message = any(message.get("role") == "tool" for message in messages)
+        if action == "final_answer" and not has_tool_message:
             #TODO: Add comment for what are we doing here and why? 
             step = {
                 "action": "tool_use",
@@ -899,8 +1310,12 @@ def run_loop(llm_config, system_prompt:str, user_input:str, vectorstore=None,
                 })
             messages.append({
                 "role": "tool",
-                "content": json.dumps(tool_result, ensure_ascii=False),
-                })
+                "name": step.get("tool"),
+                "content": json.dumps(
+                    tool_result,
+                    ensure_ascii=False,
+                ),
+            })
             continue
         return {
             "answer": "I don't know.",
