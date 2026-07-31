@@ -37,6 +37,8 @@ from langchain_core.documents import Document
 import hashlib
 import math
 
+from datetime import datetime, timezone
+
 
 model_path = str(Path.home() / "Desktop" / "agents-from-scratch" / "models" / "llama-3-8b-instruct.gguf")
 
@@ -114,34 +116,9 @@ DROPBOX_DIR = (
 
 ToolHandler = Callable[[dict, Any], Any]
 
-TOOL_REGISTRY = {
-    "search_docs": {
-        "description": (
-            "Search company documents for information "
-            "relevant to the user's question."
-        ),
-        "arguments": {
-            "query": "string",
-            "k": "integer, default 4",
-        },
-        "handler": execute_search_docs,
-    },
-    "summarize_docs": {
-        "description": (
-            "List or summarize the documents available "
-            "in the vector database."
-        ),
-        "arguments": {
-            "limit": "integer, default 5",
-        },
-        "handler": execute_summarize_docs,
-    },
-    "none": {
-        "description": "Use when no tool is required.",
-        "arguments": {},
-        "handler": execute_none,
-    },
-}
+DEFAULT_SEARCH_K = 4
+SUMMARY_PAGE_SIZE = 500
+TRACE_DIR = BASE_DIR / "local_traces"
 
 def main() -> None:
     args = parse_args()
@@ -155,6 +132,7 @@ def main() -> None:
     llm_provider=args.llm_provider
     openai_model=args.openai_model
     reindex=args.reindex
+    trace=args.trace
 
     system_prompt=("You are an assistant who truthfully and thoughtfully answers questions the members of UFund Investment LLC have.")
 
@@ -214,6 +192,7 @@ def main() -> None:
         max_steps=max_steps,
         max_tokens=max_tokens,
         temperature=temperature,
+        trace=trace
     )
     print(json.dumps(agent_result, indent=2, ensure_ascii=False))
 
@@ -250,6 +229,7 @@ def parse_args():
     parser.add_argument("--llm-provider", choices=["local","openai"],default="local",)
     parser.add_argument("--openai-model", default="gpt-3.5-turbo",)
     parser.add_argument("--reindex", action="store_true")
+    parser.add_argument("--trace", action="store_true", help="Save agent messages, actions, and tool outputs locally.")
     return parser.parse_args()
 
 ###############
@@ -483,7 +463,7 @@ def load_documents(DOCS_PATH,printing=False,source_system="local"):
             if suffix == ".xlsx":
                 loaded_docs = load_xlsx_documents(
                     path=path,
-                    rows_per_document=50,
+                    rows_per_document=15,
                 )
             else:
                 if suffix in ['.txt', '.md']:
@@ -503,6 +483,7 @@ def load_documents(DOCS_PATH,printing=False,source_system="local"):
                 loaded_docs = loader.load()
             for doc in loaded_docs:
                 resolved_path = path.resolve()
+                original_content = doc.page_content.strip()
                 doc.metadata["source"] = str(resolved_path)
                 doc.metadata["source_system"] = source_system
                 doc.metadata["relative_path"] = str(
@@ -511,10 +492,8 @@ def load_documents(DOCS_PATH,printing=False,source_system="local"):
                 doc.metadata["file_name"] = path.name
                 doc.metadata["file_type"] = suffix
                 doc.page_content = (
-                    f"File name: {path.name}\n"
-                    f"Source system: {source_system}\n"
-                    f"Source: {resolved_path}\n\n"
-                    f"{doc.page_content}"
+                    f"File name: {path.name}\n\n"
+                    f"{original_content}"
                 )
             docs.extend(loaded_docs)
         except Exception as e:
@@ -692,7 +671,15 @@ def reindex_documents(embeddings, export_drive: bool = False,):
             chunk_overlap=CHUNK_OVERLAP,
         )
     )
-    splits = text_splitter.split_documents(docs)
+    splits = []
+
+    for doc in docs:
+        if doc.metadata.get("file_type") == ".xlsx":
+            splits.append(doc)
+        else:
+            splits.extend(
+                text_splitter.split_documents([doc])
+            )
 
     if not splits:
         raise RuntimeError(
@@ -1042,56 +1029,77 @@ def execute_tool_call(tool_call:dict,vectorstore=None,)->Any:
     except Exception as e:
         return {"tool": tool_name, "arguments": arguments, "error": str(e), "success": False,}
 
-def search_docs(vectorstore, query: str, k: int = 4):
+def search_docs(vectorstore, query: str, k: int = DEFAULT_SEARCH_K):
     retrieved_docs = vectorstore.similarity_search(
         query,
         k=k,
     )
     results=[]
-    for doc in retrieved_docs:
+    for evidence_id, doc in enumerate(retrieved_docs, start=1):
         results.append({
+            "evidence_id": evidence_id,
             "file_name": doc.metadata.get("file_name"),
-            "source_system": doc.metadata.get("source_system"),
-            "relative_path": doc.metadata.get("relative_path"),
+            "source_system": doc.metadata.get(
+                "source_system"
+            ),
+            "relative_path": doc.metadata.get(
+                "relative_path"
+            ),
             "source": doc.metadata.get("source"),
-            "file_type": doc.metadata.get("file_type"),
-            "sheet_name": doc.metadata.get("sheet_name"),
-            "row_start": doc.metadata.get("row_start"),
-            "row_end": doc.metadata.get("row_end"),
+            "file_type": doc.metadata.get(
+                "file_type"
+            ),
+            "sheet_name": doc.metadata.get(
+                "sheet_name"
+            ),
+            "row_start": doc.metadata.get(
+                "row_start"
+            ),
+            "row_end": doc.metadata.get(
+                "row_end"
+            ),
             "content": doc.page_content,
         })
     return results
 
 def summarize_docs(vectorstore, limit:int=5):
-    stored_data = vectorstore.get(
-        include=["metadatas"]
-    )
-    metadatas = stored_data.get("metadatas") or []
-    file_names=sorted({metadata.get("file_name", "unknown") for metadata in metadatas if metadata})
-    return {
-        "available_files": file_names[:limit],
-        "file_count": len(file_names)
-        }
-
-def execute_tool(tool_name: str, arguments: dict, vectorstore=None):
-    #TODO: Can we provide the tools using a dictionary? e.g. {'search_docs': search_docs}, so here one can just use tool_dict.get(tool_name)
-    tool_handler = TOOL_REGISTRY.get(tool_name)
-    if tool_handler is None:
-        raise ValueError(
-            f"Unknown tool: {tool_name}"
+    file_names = set()
+    offset = 0
+    while True:
+        stored_page = vectorstore.get(
+            include=["metadatas"],
+            limit=page_size,
+            offset=offset,
         )
-
-    return tool_handler(
-        arguments=arguments,
-        vectorstore=vectorstore,
-    )
+        metadatas = (
+            stored_page.get("metadatas")
+            or []
+        )
+        if not metadatas:
+            break
+        for metadata in metadatas:
+            if not metadata:
+                continue
+            file_names.add(
+                metadata.get(
+                    "file_name",
+                    "unknown",
+                )
+            )
+        if len(metadatas) < page_size:
+            break
+        offset += page_size
+    sorted_file_names = sorted(file_names)
+    return {
+        "available_files": sorted_file_names[:limit],
+        "file_count": len(sorted_file_names),
+    }
 
 def execute_search_docs(arguments: dict, vectorstore,):
     if vectorstore is None:
         raise ValueError(
             "vectorstore is required for search_docs"
         )
-
     return search_docs(
         vectorstore=vectorstore,
         query=arguments.get("query", ""),
@@ -1104,7 +1112,6 @@ def execute_summarize_docs(arguments: dict, vectorstore,):
         raise ValueError(
             "vectorstore is required for summarize_docs"
         )
-
     return summarize_docs(
         vectorstore=vectorstore,
         limit=int(arguments.get("limit", 5)),
@@ -1114,6 +1121,131 @@ def execute_summarize_docs(arguments: dict, vectorstore,):
 def execute_none(arguments: dict, vectorstore,):
     return "No tool used."
 
+TOOL_REGISTRY = {
+    "search_docs": {
+        "description": (
+            "Search company documents for information "
+            "relevant to the user's question."
+        ),
+        "arguments": {
+            "query": "string",
+            "k": "integer, default 4",
+        },
+        "handler": execute_search_docs,
+    },
+    "summarize_docs": {
+        "description": (
+            "List or summarize the documents available "
+            "in the vector database."
+        ),
+        "arguments": {
+            "limit": "integer, default 5",
+        },
+        "handler": execute_summarize_docs,
+    },
+    "none": {
+        "description": "Use when no tool is required.",
+        "arguments": {},
+        "handler": execute_none,
+    },
+}
+
+def execute_tool(tool_name: str, arguments: dict, vectorstore=None):
+    tool_spec = TOOL_REGISTRY.get(tool_name)
+    if tool_spec is None:
+        raise ValueError(
+            f"Unknown tool: {tool_name}"
+        )
+    tool_handler = tool_spec.get("handler")
+    if not callable(tool_handler):
+        raise TypeError(
+            f"Tool '{tool_name}' has no callable handler."
+        )
+    return tool_handler(
+        arguments=arguments,
+        vectorstore=vectorstore,
+    )
+
+def get_successful_tool_messages(messages: list[dict], tool_name: str | None = None,) -> list[dict]:
+    return [message for message in messages if (
+            message.get("role") == "tool"
+            and message.get("success") is True
+            and (tool_name is None or message.get("name") == tool_name)
+            )]
+
+def get_latest_successful_tool_payload(messages: list[dict], tool_name: str | None = None) -> dict | None:
+    successful_messages = (get_successful_tool_messages(
+            messages=messages,
+            tool_name=tool_name,
+        ))
+    for message in reversed(successful_messages):
+        content = message.get("content", {})
+        if isinstance(content, dict):
+            payload = content
+        else:
+            try:
+                payload = json.loads(content)
+            except (json.JSONDecodeError, TypeError):
+                continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+def get_latest_search_results(messages: list[dict]) -> list[dict]:
+    payload = get_latest_successful_tool_payload(
+        messages=messages,
+        tool_name="search_docs",
+    )
+    if not payload:
+        return []
+    results = payload.get("result", [])
+    return results if isinstance(results, list) else []
+
+def get_documents_used(messages: list[dict], evidence_ids: list[int]) -> list[dict]:
+    search_results = get_latest_search_results(messages)
+    results_by_id = {
+        result.get("evidence_id"): result
+        for result in search_results
+    }
+    documents_used = []
+    seen_sources = set()
+    for evidence_id in evidence_ids:
+        result = results_by_id.get(evidence_id)
+        if result is None:
+            continue
+        source_key = (
+            result.get("source_system"),
+            result.get("relative_path"),
+            result.get("sheet_name"),
+            result.get("row_start"),
+            result.get("row_end"),
+        )
+        if source_key in seen_sources:
+            continue
+        seen_sources.add(source_key)
+        documents_used.append({
+            "evidence_id": evidence_id,
+            "file_name": result.get("file_name"),
+            "source_system": result.get(
+                "source_system"
+            ),
+            "relative_path": result.get(
+                "relative_path"
+            ),
+            "file_type": result.get(
+                "file_type"
+            ),
+            "sheet_name": result.get(
+                "sheet_name"
+            ),
+            "row_start": result.get(
+                "row_start"
+            ),
+            "row_end": result.get(
+                "row_end"
+            ),
+        })
+    return documents_used
 
 ########
 # LOOP #
@@ -1164,47 +1296,61 @@ def render_tool_descriptions() -> str:
     return "\n\n".join(sections)
 
 def agent_step(llm_config, messages:list[dict], system_prompt:str,
-               max_tokens:int=128,temperature:float=0.0,
+               max_tokens:int=128,temperature:float=0.0, max_parse_attempts:int=3,
                    stop=["<|eot_id|>", "<|end_of_text|>", "\n#", "\n\n"])-> dict | None:
     conversation = render_messages(messages)
     available_tools = render_tool_descriptions()
-
-    tool_messages = [
-        message
-        for message in messages
-        if message.get("role") == "tool"
-    ]
-
-    if tool_messages:
-        last_tool_name = tool_messages[-1].get(
-            "name",
-            "unknown",
+    successful_tool_messages = (get_successful_tool_messages(messages))
+    latest_successful_tool_name = (
+        successful_tool_messages[-1].get("name")
+        if successful_tool_messages
+        else None
+    )
+    search_results = get_latest_search_results(messages)
+    available_evidence_ids = {
+        result.get("evidence_id")
+        for result in search_results
+        if isinstance(
+            result.get("evidence_id"),
+            int,
         )
+    }
+    if successful_tool_messages:
         tool_status = (
-            f"A result from the '{last_tool_name}' tool "
-            "is available. Use it when deciding the next "
-            "action. Call another tool only when necessary."
+            f"A successful result from "
+            f"'{latest_successful_tool_name}' is already "
+            "available. You MUST now return final_answer. "
+            "Do not request another tool. Use only the "
+            "existing tool evidence."
         )
     else:
         tool_status = (
-            "No tool result is available yet. "
-            "Select an appropriate tool when needed."
+            "No successful tool result is available. "
+            "Use search_docs for questions about document "
+            "content. Use summarize_docs only when the user "
+            "asks which documents are available."
         )
 
-    prompt = f"""{system_prompt}
+    base_prompt = f"""{system_prompt}
 
-You are an agent that may request a tool or return a final answer.
+You are an agent that may request one tool or return a final answer.
 
 Available tools:
 {available_tools}
 
 CRITICAL INSTRUCTIONS:
-1. Respond with ONLY valid JSON.
-2. Do not include markdown or explanatory text outside JSON.
+1. Respond with ONLY one valid JSON object.
+2. Do not include markdown or text outside the JSON.
 3. Use only tools listed under Available tools.
 4. Do not use outside knowledge for company-document questions.
-5. Use existing tool results before requesting another tool.
-6. Return final_answer when sufficient information is available.
+5. Every factual claim must be supported by existing tool output.
+6. Do not infer facts merely from filenames or folder paths.
+7. If the evidence is insufficient, answer "I don't know."
+8. Use search_docs for questions about document contents.
+9. Use summarize_docs only to list or count available documents.
+10. After one tool succeeds, return final_answer without calling another tool.
+11. For search_docs evidence, cite evidence IDs as [1], [2], and so on.
+12. Include only evidence_ids that directly support the answer.
 
 Tool status:
 {tool_status}
@@ -1215,7 +1361,10 @@ For tool use:
 {{"action": "tool_use", "tool": "tool_name", "arguments": {{}}, "reason": "why the tool is needed"}}
 
 For final answer:
-{{"action": "final_answer", "answer": "answer text", "reason": "why the answer is supported"}}
+{{"action": "final_answer", "answer": "answer text with citations such as [1]", "evidence_ids": [1], "reason": "why the cited evidence supports the answer"}}
+
+For an unsupported answer:
+{{"action": "final_answer", "answer": "I don't know.", "evidence_ids": [], "reason": "the retrieved evidence is insufficient"}}
 
 Conversation:
 {conversation}
@@ -1225,42 +1374,188 @@ Response (JSON only):"""
     stop_sequences = stop or [
         "<|eot_id|>",
         "<|end_of_text|>",
-        "\n#",
     ]
 
+    retry_feedback = ""
     for attempt in range(max_parse_attempts):
+        current_prompt = (base_prompt + retry_feedback)
         response = call_llm_text(
             llm_config=llm_config,
-            prompt=prompt,
+            prompt=current_prompt,
             max_tokens=max_tokens,
             temperature=temperature,
             stop=stop_sequences,
         )
         parsed = extract_json_from_text(response)
         if not parsed:
+            retry_feedback = f"""
+
+RETRY FEEDBACK:
+Your previous response was not valid JSON:
+
+{response}
+
+Return exactly one valid JSON object.
+"""
             continue
         action = parsed.get("action")
         if action == "tool_use":
             tool_name = parsed.get("tool")
+            arguments = parsed.get("arguments")
+            if successful_tool_messages:
+                retry_feedback = """
+
+RETRY FEEDBACK:
+A tool has already completed successfully.
+Do not request another tool.
+Return final_answer using the existing result.
+"""
+                continue
+
             if tool_name not in TOOL_REGISTRY:
+                retry_feedback = f"""
+
+RETRY FEEDBACK:
+"{tool_name}" is not an available tool.
+Choose one tool listed under Available tools.
+"""
                 continue
-            if not isinstance(parsed.get("arguments"), dict,):
+
+            if not isinstance(arguments, dict):
+                retry_feedback = """
+
+RETRY FEEDBACK:
+The "arguments" field must be a JSON object.
+"""
                 continue
+
         elif action == "final_answer":
-            if not isinstance(parsed.get("answer"), str,):
+            answer = parsed.get("answer")
+            evidence_ids = parsed.get("evidence_ids", [])
+
+            if not isinstance(answer, str):
+                retry_feedback = """
+
+RETRY FEEDBACK:
+A final_answer must contain an "answer" string.
+"""
                 continue
+
+            if not successful_tool_messages:
+                retry_feedback = """
+
+RETRY FEEDBACK:
+No successful tool result exists yet.
+Request an appropriate tool before answering.
+"""
+                continue
+
+            if not isinstance(evidence_ids, list):
+                retry_feedback = """
+
+RETRY FEEDBACK:
+"evidence_ids" must be a JSON list.
+"""
+                continue
+
+            if latest_successful_tool_name == "search_docs":
+                invalid_evidence_ids = [
+                    evidence_id
+                    for evidence_id in evidence_ids
+                    if (not isinstance(evidence_id,int)
+                        or evidence_id
+                        not in available_evidence_ids
+                    )
+                ]
+
+                if invalid_evidence_ids:
+                    retry_feedback = f"""
+
+RETRY FEEDBACK:
+Invalid evidence IDs were provided.
+Available evidence IDs are:
+{sorted(available_evidence_ids)}
+"""
+                    continue
+
+                normalized_answer = (
+                    answer.strip()
+                    .lower()
+                    .rstrip(".")
+                )
+
+                is_unknown_answer = (
+                    normalized_answer.startswith(
+                        "i don't know"
+                    )
+                    or normalized_answer.startswith(
+                        "i do not know"
+                    )
+                )
+
+                if (
+                    not is_unknown_answer
+                    and not evidence_ids
+                ):
+                    retry_feedback = """
+
+RETRY FEEDBACK:
+A factual answer based on search_docs must include
+at least one valid evidence_id. Otherwise answer
+"I don't know."
+"""
+                    continue
+
+            else:
+                parsed["evidence_ids"] = []
+
         else:
+            retry_feedback = """
+
+RETRY FEEDBACK:
+The "action" field must be either:
+- "tool_use"
+- "final_answer"
+"""
             continue
+
         parsed.setdefault(
             "reason",
             f"Taking action: {action}",
         )
+
         return parsed
-    
+
     return None
 
+def create_trace_path() -> Path:
+    TRACE_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    return TRACE_DIR / (f"agent_trace_{timestamp}.jsonl")
+
+def append_trace_event(trace_path: Path | None, event: dict) -> None:
+    if trace_path is None:
+        return
+    trace_record = {
+        "timestamp": datetime.now(
+            timezone.utc
+        ).isoformat(),
+        **event,
+    }
+    with trace_path.open(
+        "a",
+        encoding="utf-8",
+    ) as trace_file:
+        trace_file.write(
+            json.dumps(
+                trace_record,
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+
 def run_loop(llm_config, system_prompt:str, user_input:str, vectorstore=None,
-             max_tokens:int=512,temperature:float=0.0,max_steps:int=5):
+             max_tokens:int=512,temperature:float=0.0,max_steps:int=5,trace:bool=False):
     messages=[
         {
             "role": "user",
@@ -1268,65 +1563,142 @@ def run_loop(llm_config, system_prompt:str, user_input:str, vectorstore=None,
             }
         ]
     steps=[]
-    for step_number in range(1, max_steps+1):
-        #TODO: add logging for the messages used in each step, you can log into a file
-        step=agent_step(llm_config=llm_config,messages=messages,system_prompt=system_prompt,
-                        max_tokens=max_tokens,temperature=temperature,)
+    trace_path = (create_trace_path() if trace else None)
+
+    def finish(result: dict) -> dict:
+        if trace_path is not None:
+            result["trace_file"] = str(trace_path)
+        append_trace_event(
+            trace_path,
+            {
+                "event": "run_finished",
+                "result": result,
+            },
+        )
+        return result
+
+    for step_number in range(1, max_steps + 1):
+        #Logging convo given to agent_step
+        append_trace_event(
+            trace_path,
+            {
+                "event": "agent_step_input",
+                "step_number": step_number,
+                "messages": messages,
+            },
+        )
+        step = agent_step(
+            llm_config=llm_config,
+            messages=messages,
+            system_prompt=system_prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        append_trace_event(
+            trace_path,
+            {
+                "event": "agent_step_output",
+                "step_number": step_number,
+                "step": step,
+            },
+        )
         if step is None:
-            return {
-                "answer": "I don't know",
+            return finish({
+                "answer": "I don't know.",
+                "documents_used": [],
                 "steps": steps,
-                "error": "Agent failed to return valid JSON."
-                }
-        steps.append(step)
-        action=step.get("action")
-        #TODO: change has_tool_result to a better name
-        has_tool_message = any(message.get("role") == "tool" for message in messages)
-        if action == "final_answer" and not has_tool_message:
-            #TODO: Add comment for what are we doing here and why? 
-            step = {
-                "action": "tool_use",
-                "tool": "search_docs",
-                "arguments": {
-                    "query": user_input,
-                    "k": 4,
-                },
-                "reason": "A document search is required before answering.",
-            }
-            action = "tool_use"
+                "error": (
+                    "Agent failed to return a valid action."
+                ),
+            })
+        action = step.get("action")
         if action == "final_answer":
-            return {
-                "answer": step.get("answer", "I don't know."),
+            if not get_successful_tool_messages(messages):
+                return finish({
+                    "answer": "I don't know.",
+                    "documents_used": [],
+                    "steps": steps,
+                    "error": (
+                        "Agent attempted to answer before "
+                        "a tool completed successfully."
+                    ),
+                })
+            steps.append(step)
+            evidence_ids = step.get("evidence_ids", [])
+            documents_used = get_documents_used(
+                messages=messages,
+                evidence_ids=evidence_ids,
+            )
+            return finish({
+                "answer": step.get(
+                    "answer",
+                    "I don't know.",
+                ),
+                "documents_used": documents_used,
                 "steps": steps,
-                }
-        if action=="tool_use":
+            })
+        if action == "tool_use":
+            steps.append(step)
             tool_result = execute_tool_call(
                 tool_call=step,
                 vectorstore=vectorstore,
             )
-            messages.append({
+            assistant_message = {
                 "role": "assistant",
-                "content": json.dumps(step,ensure_ascii=False),
-                })
-            messages.append({
+                "content": json.dumps(
+                    step,
+                    ensure_ascii=False,
+                ),
+            }
+            tool_message = {
                 "role": "tool",
                 "name": step.get("tool"),
+                "success": tool_result.get(
+                    "success",
+                    False,
+                ),
                 "content": json.dumps(
                     tool_result,
                     ensure_ascii=False,
                 ),
-            })
+            }
+            messages.extend([assistant_message, tool_message])
+            append_trace_event(
+                trace_path,
+                {
+                    "event": "tool_result",
+                    "step_number": step_number,
+                    "tool": step.get("tool"),
+                    "result": tool_result,
+                },
+            )
+            if not tool_result.get("success", False):
+                return finish({
+                    "answer": "I don't know.",
+                    "documents_used": [],
+                    "steps": steps,
+                    "error": (
+                        f"Tool '{step.get('tool')}' failed: "
+                        f"{tool_result.get('error')}"
+                    ),
+                })
             continue
-        return {
+        steps.append(step)
+        return finish({
             "answer": "I don't know.",
+            "documents_used": [],
             "steps": steps,
             "error": f"Unknown action: {action}",
-            }
-    return {
+        })
+    return finish({
         "answer": "I don't know.",
+        "documents_used": [],
         "steps": steps,
-        "error": "Reached max_steps before final answer.",
-        }
+        "error": (
+            "Reached max_steps before producing "
+            "a final answer."
+        ),
+    })
 
 if __name__ == "__main__":
     main()

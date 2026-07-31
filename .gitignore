@@ -2,6 +2,12 @@
 .env
 token.json
 credentials.json
+
 exported_docs_for_rag/
-local_traces/
 chroma_db/
+local_traces/
+reindex_state.json
+
+__pycache__/
+.pytest_cache/
+*.pyc
