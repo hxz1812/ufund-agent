@@ -6,6 +6,7 @@ credentials.json
 exported_docs_for_rag/
 chroma_db/
 local_traces/
+telemetry_logs/
 reindex_state.json
 
 __pycache__/

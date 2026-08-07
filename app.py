@@ -32,7 +32,9 @@ import hashlib
 import math
 
 from datetime import datetime, timezone
-
+import time
+from dataclasses import dataclass, asdict
+from uuid import uuid4
 
 model_path = str(Path.home() / "Desktop" / "agents-from-scratch" / "models" / "llama-3-8b-instruct.gguf")
 
@@ -101,8 +103,157 @@ DEFAULT_SEARCH_K = 4
 SUMMARY_PAGE_SIZE = 500
 TRACE_DIR = BASE_DIR / "local_traces"
 
+TELEMETRY_DIR = BASE_DIR / "telemetry_logs"
+TELEMETRY_LOG_PATH = (TELEMETRY_DIR / "agent_telemetry.jsonl")
+
 SYSTEM_PROMPT=("You are an assistant who truthfully and thoughtfully answers "
                "questions the members of UFund Investment LLC have.")
+
+#############
+# TELEMETRY #
+#############
+@dataclass
+class Span:
+    span_id: str
+    trace_id: str
+    event_type: str
+    timestamp: str
+    duration_ms: float | None = None
+    success: bool | None = None
+    data: dict | None = None
+    error: str | None = None
+
+@dataclass
+class Metrics:
+    llm_calls: int=0
+    llm_failures: int=0
+    llm_retries: int=0
+    json_parse_failures: int=0
+    tool_calls: int=0
+    tool_failures: int=0
+    total_llm_latency_ms: float=0.0
+
+    @property
+    def avg_llm_latency_ms(self) -> float:
+        if self.llm_calls==0:
+            return 0.0
+        return (self.total_llm_latency_ms / self.llm_calls)
+
+    @property
+    def llm_success_rate(self) -> float:
+        if self.llm_calls==0:
+            return 0.0
+        return (1-self.llm_failures/self.llm_calls)
+
+    @property
+    def tool_success_rate(self) -> float:
+        if self.tool_calls==0:
+            return 0.0
+        return (1-self.tool_failures/self.tool_calls)
+
+class Telemetry:
+    def __init__(self, log_file: Path = TELEMETRY_LOG_PATH,):
+        self.log_file = Path(log_file)
+        self.current_trace_id = None
+        self.metrics = Metrics()
+
+    def start_trace(self) -> str:
+        self.current_trace_id = (uuid4().hex[:8])
+        self.log_event(event_type="trace_started", success=True,)
+        return self.current_trace_id
+
+    def write_span(self, span: Span,) -> None:
+        self.log_file.parent.mkdir(parents=True, exist_ok=True,)
+        with self.log_file.open("a", encoding="utf-8",) as file:
+            file.write(json.dumps(asdict(span), ensure_ascii=False,)+"\n")
+
+    def log_event(self, event_type: str, success: bool | None = None,
+                  duration_ms: float | None = None, data: dict | None = None,
+                  error: str | None = None,) -> None:
+        span = Span(
+            span_id=uuid4().hex[:8],
+            trace_id=(self.current_trace_id or "no-trace"),
+            event_type=event_type,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            duration_ms=(round(duration_ms,2)
+                         if duration_ms is not None else None),
+            success=success,
+            data=data,
+            error=error,
+            )
+        self.write_span(span)
+
+    def log_llm_call(self, provider: str, prompt_length: int,
+                     response_length: int, duration_ms: float, success: bool,
+                     error: str | None = None,) -> None:
+        self.metrics.llm_calls+=1
+        self.metrics.total_llm_latency_ms+=(duration_ms)
+        if not success:
+            self.metrics.llm_failures+=1
+        self.log_event(
+            event_type="llm_call",
+            duration_ms=duration_ms,
+            success=success,
+            data={
+                "provider": provider,
+                "prompt_length": prompt_length,
+                "response_length": response_length,
+                },
+            error=error,
+            )
+
+    def log_llm_retry(self, attempt_number: int,) -> None:
+        self.metrics.llm_retries+=1
+        self.log_event(
+            event_type="llm_retry",
+            success=False,
+            data={"attempt_number": attempt_number,},
+            )
+
+    def log_json_parse_failure(self,) -> None:
+        self.metrics.json_parse_failures+=1
+        self.log_event(event_type="json_parse_failure", success=False,)
+
+    def log_tool_call(self, tool_name: str, arguments: dict, duration_ms: float,
+                      success: bool, error: str | None = None,) -> None:
+        self.metrics.tool_calls+=1
+        if not success:
+            self.metrics.tool_failures+=1
+        self.log_event(
+            event_type="tool_call",
+            duration_ms=duration_ms,
+            success=success,
+            data={"tool": tool_name, "arguments": arguments,},
+            error=error,
+            )
+
+    def log_decision(self, action: str, tool_name: str | None = None,) -> None:
+        self.log_event(
+            event_type="agent_decision",
+            success=True,
+            data={"action": action, "tool": tool_name,},
+            )
+
+    def finish_trace(self, success: bool, error: str | None = None,) -> None:
+        self.log_event(
+            event_type="trace_finished",
+            success=success,
+            error=error,
+            )
+
+    def print_summary(self) -> None:
+        print()
+        print("=" * 45)
+        print("TELEMETRY SUMMARY")
+        print("=" * 45)
+        print(f"LLM Calls: {self.metrics.llm_calls}")
+        print(f"LLM Success: {self.metrics.llm_success_rate: .1%}")
+        print(f"Avg LLM Latency: {self.metrics.avg_llm_latency_ms: .0f} ms")
+        print(f"LLM Retries: {self.metrics.llm_retries}")
+        print(f"JSON Failures: {self.metrics.json_parse_failures}")
+        print(f"Tool Calls: {self.metrics.tool_calls}")
+        print(f"Tool Success: {self.metrics.tool_success_rate: .1%}")
+        print("=" * 45)
 
 def main() -> None:
     args = parse_args()
@@ -117,6 +268,9 @@ def main() -> None:
     openai_model=args.openai_model
     reindex=args.reindex
     trace=args.trace
+    telemetry_enabled=args.telemetry
+
+    telemetry = Telemetry() if telemetry_enabled else None
 
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError(
@@ -176,9 +330,12 @@ def main() -> None:
         max_steps=max_steps,
         max_tokens=max_tokens,
         temperature=temperature,
-        trace=trace
+        trace=trace,
+        telemetry=telemetry,
     )
     print(json.dumps(agent_result, indent=2, ensure_ascii=False))
+    if telemetry is not None:
+        telemetry.print_summary()
 
 
 ##############
@@ -196,6 +353,7 @@ def parse_args():
     parser.add_argument("--openai-model", default="gpt-3.5-turbo",)
     parser.add_argument("--reindex", action="store_true")
     parser.add_argument("--trace", action="store_true", help="Save agent messages, actions, and tool outputs locally.")
+    parser.add_argument("--telemetry", action="store_true", help=("Record runtime telemetry including LLM latency, retries, and tool calls."),)
     return parser.parse_args()
 
 ###############
@@ -224,16 +382,46 @@ def build_llm(llm_provider,model_path,n_ctx,temperature,openai_model):
             }
     raise ValueError(f"Unsupported LLM provider: {llm_provider}")
 
-def call_llm_text(llm_config, prompt, max_tokens=512, temperature=0, stop=None,):
+def call_llm_text(llm_config, prompt, max_tokens=512, temperature=0, stop=None,
+                  telemetry=None,):
     provider=llm_config["provider"]
     client = llm_config["client"]
-    if provider == "local":
-        response= client(prompt=prompt,max_tokens=max_tokens,temperature=temperature,stop=stop or ["<|eot_id|>", "User:"])
-        return response["choices"][0]["text"].strip()
-    if provider=="openai":
-        response=client.invoke(prompt)
-        return response.content.strip()
-    raise ValueError(f"Unsupported LLM provider: {provider}")
+    start_time=time.perf_counter()
+    try:
+        if provider == "local":
+            response = client(prompt=prompt,max_tokens=max_tokens,
+                             temperature=temperature,
+                             stop=(stop or ["<|eot_id|>","User:"]))
+            text = response["choices"][0]["text"].strip()
+        elif provider=="openai":
+            response=client.invoke(prompt)
+            text = response.content.strip()
+        else:
+            raise ValueError(f"Unsupported LLM provider: {provider}")
+
+        duration_ms=(time.perf_counter()-start_time)*1000
+
+        if telemetry is not None:
+            telemetry.log_llm_call(
+                provider=provider,
+                prompt_length=len(prompt),
+                response_length=len(text),
+                duration_ms=duration_ms,
+                success=True,
+                )
+        return text
+    except Exception as error:
+        duration_ms=(time.perf_counter()-start_time)*1000
+        if telemetry is not None:
+            telemetry.log_llm_call(
+                provider=provider,
+                prompt_length=len(prompt),
+                response_length=0,
+                duration_ms=duration_ms,
+                success=False,
+                error=str(error),
+                )
+        raise
         
     
 ####################
@@ -770,14 +958,33 @@ def extract_json_from_text(text: str) -> dict | None:
 #########
 # TOOLS #
 #########
-def execute_tool_call(tool_call:dict,vectorstore=None,)->Any:
+def execute_tool_call(tool_call:dict,vectorstore=None,telemetry=None)->Any:
     tool_name=tool_call.get("tool")
     arguments=tool_call.get("arguments",{}) or {}
+    start_time=time.perf_counter()
     try:
-        result=execute_tool(tool_name=tool_name,arguments=arguments,vectorstore=vectorstore,)
-        return {"tool": tool_name, "arguments": arguments, "result": result, "success": True,}
-    except Exception as e:
-        return {"tool": tool_name, "arguments": arguments, "error": str(e), "success": False,}
+        result=execute_tool(tool_name=tool_name,arguments=arguments,
+                            vectorstore=vectorstore,)
+        duration_ms=(time.perf_counter()-start_time)*1000
+        if telemetry is not None:
+            telemetry.log_tool_call(
+                tool_name=tool_name,
+                arguments=arguments,
+                duration_ms=duration_ms,
+                success=True,)
+        return {"tool": tool_name, "arguments": arguments, "result": result,
+                "success": True,}
+    except Exception as error:
+        duration_ms=(time.perf_counter()-start_time)*1000
+        if telemetry is not None:
+            telemetry.log_tool_call(
+                tool_name=tool_name,
+                arguments=arguments,
+                duration_ms=duration_ms,
+                success=False,
+                error=str(error),)
+        return {"tool": tool_name, "arguments": arguments, "error": str(error),
+                "success": False,}
 
 #TODO: Add new tools
 def search_docs(vectorstore, query: str, k: int = DEFAULT_SEARCH_K):
@@ -1039,8 +1246,10 @@ def render_tool_descriptions() -> str:
     return "\n\n".join(sections)
 
 def agent_step(llm_config, messages:list[dict], system_prompt:str,
-               max_tokens:int=128,temperature:float=0.0, max_parse_attempts:int=3,
-                   stop=["<|eot_id|>", "<|end_of_text|>", "\n#", "\n\n"])-> dict | None:
+               max_tokens:int=128,temperature:float=0.0,
+               max_parse_attempts:int=3,
+               stop=["<|eot_id|>", "<|end_of_text|>", "\n#", "\n\n"],
+               telemetry=None,) -> dict | None:
     conversation = render_messages(messages)
     available_tools = render_tool_descriptions()
     successful_tool_messages = (get_successful_tool_messages(messages))
@@ -1121,6 +1330,8 @@ Response (JSON only):"""
 
     retry_feedback = ""
     for attempt in range(max_parse_attempts):
+        if attempt>0 and telemetry is not None:
+            telemetry.log_llm_retry(attempt_number=attempt+1)
         current_prompt = (base_prompt + retry_feedback)
         response = call_llm_text(
             llm_config=llm_config,
@@ -1128,9 +1339,12 @@ Response (JSON only):"""
             max_tokens=max_tokens,
             temperature=temperature,
             stop=stop_sequences,
+            telemetry=telemetry,
         )
         parsed = extract_json_from_text(response)
         if not parsed:
+            if telemetry is not None:
+                telemetry.log_json_parse_failure()
             retry_feedback = f"""
 
 RETRY FEEDBACK:
@@ -1267,6 +1481,10 @@ The "action" field must be either:
             f"Taking action: {action}",
         )
 
+        if telemetry is not None:
+            telemetry.log_decision(action=parsed.get("action","unknown",),
+                                   tool_name=parsed.get("tool"),)
+
         return parsed
 
     return None
@@ -1298,7 +1516,11 @@ def append_trace_event(trace_path: Path | None, event: dict) -> None:
         )
 
 def run_loop(llm_config, system_prompt:str, user_input:str, vectorstore=None,
-             max_tokens:int=512,temperature:float=0.0,max_steps:int=5,trace:bool=False):
+             max_tokens:int=512,temperature:float=0.0,max_steps:int=5,
+             trace:bool=False, telemetry=None):
+    telemetry_trace_id=None
+    if telemetry is not None:
+        telemetry_trace_id=(telemetry.start_trace())
     messages=[
         {
             "role": "user",
@@ -1311,6 +1533,8 @@ def run_loop(llm_config, system_prompt:str, user_input:str, vectorstore=None,
     def finish(result: dict) -> dict:
         if trace_path is not None:
             result["trace_file"] = str(trace_path)
+        if telemetry_trace_id is not None:
+            result["telemetry_trace_id"]=telemetry_trace_id
         append_trace_event(
             trace_path,
             {
@@ -1318,6 +1542,11 @@ def run_loop(llm_config, system_prompt:str, user_input:str, vectorstore=None,
                 "result": result,
             },
         )
+        if telemetry is not None:
+            telemetry.finish_trace(
+                success=(result.get("error") is None),
+                error=result.get("error"),
+                )
         return result
 
     for step_number in range(1, max_steps + 1):
@@ -1336,6 +1565,7 @@ def run_loop(llm_config, system_prompt:str, user_input:str, vectorstore=None,
             system_prompt=system_prompt,
             max_tokens=max_tokens,
             temperature=temperature,
+            telemetry=telemetry,
         )
         append_trace_event(
             trace_path,
@@ -1385,6 +1615,7 @@ def run_loop(llm_config, system_prompt:str, user_input:str, vectorstore=None,
             tool_result = execute_tool_call(
                 tool_call=step,
                 vectorstore=vectorstore,
+                telemetry=telemetry,
             )
             assistant_message = {
                 "role": "assistant",
