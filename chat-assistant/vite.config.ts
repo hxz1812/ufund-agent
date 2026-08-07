@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import { defineConfig, loadEnv, type Plugin } from "vite";
 import hostingConfig from "./.openai/hosting.json";
 import { sites } from "./build/sites-vite-plugin";
+import { parseScriptOutput } from "./build/script-result.mjs";
 
 const SITE_CREATOR_PLACEHOLDER_DATABASE_ID =
   "00000000-0000-4000-8000-000000000000";
@@ -38,27 +39,112 @@ async function readJsonBody(req: IncomingMessage) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
-function extractAnswer(output: string) {
-  const text = output.trim();
-  if (!text) return null;
+type ScriptProcessResult = {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+};
 
-  const lines = text.split("\n");
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    try {
-      const value = JSON.parse(lines[index]);
-      if (value && typeof value.answer === "string") return value.answer.trim();
-    } catch {
-      // Plain-text output is also supported.
-    }
+function boundedNumber(
+  value: unknown,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+) {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed)
+    ? Math.min(maximum, Math.max(minimum, parsed))
+    : fallback;
+}
+
+function buildChatArguments(message: string, options: Record<string, unknown>) {
+  const llmProvider = options.llmProvider === "openai" ? "openai" : "local";
+  const openaiModel =
+    typeof options.openaiModel === "string" && options.openaiModel.trim()
+      ? options.openaiModel.trim().slice(0, 100)
+      : "gpt-3.5-turbo";
+  const maxTokens = Math.round(boundedNumber(options.maxTokens, 512, 64, 4096));
+  const temperature = boundedNumber(options.temperature, 0, 0, 2);
+  const nCtx = Math.round(boundedNumber(options.nCtx, 2048, 512, 32768));
+  const maxSteps = Math.round(boundedNumber(options.maxSteps, 5, 1, 10));
+
+  const args = [
+    "--prompt",
+    message,
+    "--llm-provider",
+    llmProvider,
+    "--max-tokens",
+    String(maxTokens),
+    "--temperature",
+    String(temperature),
+    "--n-ctx",
+    String(nCtx),
+    "--max-steps",
+    String(maxSteps),
+  ];
+
+  if (llmProvider === "openai") {
+    args.push("--openai-model", openaiModel);
+  }
+  if (options.trace === true) {
+    args.push("--trace");
   }
 
-  const markedAnswer = text.match(/(?:^|\n)ANSWER:\s*\n?([\s\S]*)$/i);
-  if (markedAnswer?.[1]) return markedAnswer[1].trim();
+  return args;
+}
 
-  // app.py currently prints a retrieved-document count after its answer.
-  // Keep that diagnostic out of the user-facing chat response.
-  const withoutTrailingCount = text.match(/^([\s\S]*\S)\n\d+\s*$/);
-  return withoutTrailingCount?.[1]?.trim() || text;
+function runScript(
+  pythonBin: string,
+  scriptPath: string,
+  args: string[],
+  timeoutMs: number,
+): Promise<ScriptProcessResult> {
+  return new Promise((resolveRun, rejectRun) => {
+    const child = spawn(pythonBin, [scriptPath, ...args], {
+      cwd: dirname(scriptPath),
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let outputSize = 0;
+    let timedOut = false;
+
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+    }, timeoutMs);
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      outputSize += chunk.length;
+      if (outputSize <= 2_000_000) stdout.push(chunk);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      outputSize += chunk.length;
+      if (outputSize <= 2_000_000) stderr.push(chunk);
+    });
+    child.once("error", (error) => {
+      clearTimeout(timeout);
+      rejectRun(error);
+    });
+    child.once("close", (code) => {
+      clearTimeout(timeout);
+      resolveRun({
+        code,
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8").trim(),
+        timedOut,
+      });
+    });
+  });
+}
+
+function processError(result: ScriptProcessResult) {
+  const lastErrorLine = result.stderr.split("\n").filter(Boolean).pop();
+  return lastErrorLine
+    ? `The script stopped with an error: ${lastErrorLine}`
+    : `The script stopped with exit code ${result.code}.`;
 }
 
 function localScriptBridge(runtimeEnv: Record<string, string | undefined>): Plugin {
@@ -66,21 +152,29 @@ function localScriptBridge(runtimeEnv: Record<string, string | undefined>): Plug
     name: "ufund-local-script-bridge",
     enforce: "pre",
     configureServer(server) {
+      let reindexRunning = false;
+
       server.middlewares.use(async (req, res, next) => {
         const pathname = new URL(req.url || "/", "http://localhost").pathname;
         const scriptPath =
           runtimeEnv.UFUND_SCRIPT_PATH || process.env.UFUND_SCRIPT_PATH || DEFAULT_SCRIPT_PATH;
+        const pythonBin =
+          runtimeEnv.UFUND_PYTHON_BIN ||
+          process.env.UFUND_PYTHON_BIN ||
+          (existsSync(DEFAULT_FRAMEWORK_PYTHON) ? DEFAULT_FRAMEWORK_PYTHON : "python3");
 
         if (pathname === "/api/health" && req.method === "GET") {
           sendJson(res, 200, {
             ok: true,
             scriptFound: existsSync(scriptPath),
+            indexFound: existsSync(resolve(dirname(scriptPath), "chroma_db")),
+            reindexRunning,
             scriptName: scriptPath.split("/").pop(),
           });
           return;
         }
 
-        if (pathname !== "/api/chat") {
+        if (pathname !== "/api/chat" && pathname !== "/api/reindex") {
           next();
           return;
         }
@@ -97,85 +191,109 @@ function localScriptBridge(runtimeEnv: Record<string, string | undefined>): Plug
           return;
         }
 
-        let message = "";
+        let body: Record<string, unknown> = {};
         try {
-          const body = await readJsonBody(req);
-          message = typeof body?.message === "string" ? body.message.trim() : "";
+          const parsedBody = await readJsonBody(req);
+          body = parsedBody && typeof parsedBody === "object" && !Array.isArray(parsedBody)
+            ? parsedBody
+            : {};
         } catch {
           sendJson(res, 400, { error: "The request body must be valid JSON." });
           return;
         }
 
+        if (pathname === "/api/reindex") {
+          if (reindexRunning) {
+            sendJson(res, 409, { error: "A reindex job is already running." });
+            return;
+          }
+
+          reindexRunning = true;
+          const args = ["--reindex"];
+          if (body.exportDrive === true) args.push("--export-drive");
+
+          try {
+            const result = await runScript(
+              pythonBin,
+              scriptPath,
+              args,
+              30 * 60 * 1000,
+            );
+
+            if (result.timedOut) {
+              sendJson(res, 504, {
+                error: "Reindexing took longer than 30 minutes and was stopped.",
+              });
+            } else if (result.code !== 0) {
+              sendJson(res, 500, { error: processError(result) });
+            } else {
+              sendJson(res, 200, {
+                ok: true,
+                message: body.exportDrive === true
+                  ? "Drive files were refreshed and the document index was rebuilt."
+                  : "The document index was rebuilt from the current exported files.",
+              });
+            }
+          } catch (error) {
+            sendJson(res, 500, {
+              error: `The reindex job could not start: ${error instanceof Error ? error.message : "Unknown error"}`,
+            });
+          } finally {
+            reindexRunning = false;
+          }
+          return;
+        }
+
+        if (reindexRunning) {
+          sendJson(res, 409, {
+            error: "The document index is being rebuilt. Please wait for it to finish.",
+          });
+          return;
+        }
+
+        const message = typeof body.message === "string" ? body.message.trim() : "";
         if (!message) {
           sendJson(res, 400, { error: "Please enter a question." });
           return;
         }
 
-        const pythonBin =
-          runtimeEnv.UFUND_PYTHON_BIN ||
-          process.env.UFUND_PYTHON_BIN ||
-          (existsSync(DEFAULT_FRAMEWORK_PYTHON) ? DEFAULT_FRAMEWORK_PYTHON : "python3");
-        const child = spawn(pythonBin, [scriptPath, "--prompt", message], {
-          cwd: dirname(scriptPath),
-          env: process.env,
-          stdio: ["ignore", "pipe", "pipe"],
-        });
-        const stdout: Buffer[] = [];
-        const stderr: Buffer[] = [];
-        let outputSize = 0;
-        let didTimeOut = false;
+        const options =
+          body.options && typeof body.options === "object"
+            ? body.options as Record<string, unknown>
+            : {};
 
-        const timeout = setTimeout(() => {
-          didTimeOut = true;
-          child.kill("SIGTERM");
-        }, 10 * 60 * 1000);
+        try {
+          const result = await runScript(
+            pythonBin,
+            scriptPath,
+            buildChatArguments(message, options),
+            10 * 60 * 1000,
+          );
 
-        child.stdout.on("data", (chunk: Buffer) => {
-          outputSize += chunk.length;
-          if (outputSize <= 2_000_000) stdout.push(chunk);
-        });
-        child.stderr.on("data", (chunk: Buffer) => {
-          outputSize += chunk.length;
-          if (outputSize <= 2_000_000) stderr.push(chunk);
-        });
-
-        child.on("error", (error) => {
-          clearTimeout(timeout);
-          sendJson(res, 500, { error: `The script could not start: ${error.message}` });
-        });
-
-        child.on("close", (code) => {
-          clearTimeout(timeout);
-          if (res.writableEnded) return;
-
-          const standardOutput = Buffer.concat(stdout).toString("utf8");
-          const errorOutput = Buffer.concat(stderr).toString("utf8").trim();
-
-          if (didTimeOut) {
+          if (result.timedOut) {
             sendJson(res, 504, {
               error: "The script took longer than 10 minutes and was stopped.",
             });
             return;
           }
-
-          if (code !== 0) {
-            const lastErrorLine = errorOutput.split("\n").filter(Boolean).pop();
-            sendJson(res, 500, {
-              error: lastErrorLine
-                ? `The script stopped with an error: ${lastErrorLine}`
-                : `The script stopped with exit code ${code}.`,
-            });
+          if (result.code !== 0) {
+            sendJson(res, 500, { error: processError(result) });
             return;
           }
 
-          const answer = extractAnswer(standardOutput);
+          const scriptResult = parseScriptOutput(result.stdout);
           sendJson(res, 200, {
+            ...scriptResult,
             answer:
-              answer ||
-              "The script connection is working, but app.py did not return an answer yet. You can add its response output when you’re ready.",
-            source: answer ? "script" : "placeholder",
+              scriptResult.answer ||
+              "The script connection is working, but app.py did not return an answer yet.",
+            source: scriptResult.answer ? "script" : "placeholder",
           });
-        });
+        } catch (error) {
+          sendJson(res, 500, {
+            error: `The script could not start: ${error instanceof Error ? error.message : "Unknown error"}`,
+          });
+        }
       });
     },
   };

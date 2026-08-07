@@ -12,22 +12,23 @@ class FakeVectorStore:
     def similarity_search(self, query: str, k:int=4):
         self.search_calls.append((query,k))
         return [Document(
-            page_content="Egnyte is referenced in the company document.",
+            page_content=("Egnyte is referenced in the company document."),
             metadata={
                 "file_name": "platform_sop.txt",
                 "source": "documents/platform_sop.txt",
+                "source_system": "test",
+                "relative_path": "platform_sop.txt",
                 "file_type": ".txt",
                 },
             )]
 
-    def get(self, include=None):
-        return {
-            "metadatas": [
+    def get(self, include=None, limit=500, offset=0):
+        metadatas = [
                 {"file_name": "platform_sop.txt"},
                 {"file_name": "investment_update.pdf"},
                 {"file_name": "platform_sop.txt"}, #to test duplicate handling
                 ]
-            }
+        return {"metadatas": metadatas[offset: offset+limit]}
 
 #Fake store to record documents added during reindexing
 class FakeAddVectorStore:
@@ -57,13 +58,13 @@ def test_extract_json_from_surrounding_text():
         "decision": "search_docs",
         }
 
-def text_extract_json_invalid_input():
+def test_extract_json_invalid_input():
     result = app.extract_json_from_text(
         "No valid JSON"
         )
     assert result is None
 
-def test_indexing(tmp_path):
+def test_load_documents(tmp_path):
     supported_file = tmp_path / "company_notes.txt"
     supported_file.write_text(
         "UFund uses this doc for testing.",
@@ -74,11 +75,11 @@ def test_indexing(tmp_path):
         "Unsupported content",
         encoding="utf-8",
         )
-    docs, skipped_files=app.indexing(tmp_path)
+    docs, skipped_files=app.load_documents(tmp_path)
     assert len(docs)==1
     assert docs[0].metadata["file_name"]=="company_notes.txt"
     assert docs[0].metadata["file_type"]==".txt"
-    assert "UFund uses this document" in docs[0].page_content
+    assert "UFund uses this doc for testing." in docs[0].page_content
     assert len(skipped_files)==1
     assert "unsupported file type" in skipped_files[0]
 
@@ -89,10 +90,11 @@ def test_search_docs():
         query="Egnyte",
         k=3,
         )
-    assert vectorstore.search_calls==[("Egnyte",3)]
-    assert len(results)==1
-    assert results[0]["file_name"]=="platform_sop.txt"
-    assert "Egnyte" in results[0]["content"]
+    assert (vectorstore.search_calls==[("Egnyte",3)])
+    assert (len(results)==1)
+    assert (results[0]["evidence_id"]==1)
+    assert (results[0]["file_name"]=="platform_sop.txt")
+    assert ("Egnyte" in results[0]["content"])
 
 def test_summarize_docs():
     vectorstore=FakeVectorStore()
@@ -133,20 +135,23 @@ def test_run_loop(monkeypatch):
             "tool": "search_docs",
             "arguments": {
                 "query": "Egnyte",
-                "k":2,
+                "k": 2,
                 },
             "reason": "Search company documents.",
             },
         {
             "action": "final_answer",
-            "answer": "Egnyte is mentioned in the platform SOP.",
-            "reason": "Supported by retrieved document.",
+            "answer": ("Egnyte is mentioned in the platform SOP. [1]"),
+            "evidence_ids": [1],
+            "reason": ("Supported by retrieved document."),
             },
         ])
+    
     def fake_agent_step(**kwargs):
         return next(planned_steps)
-    monkeypatch.setattr(app,"agent_step",fake_agent_step,)
-    vectorstore=FakeVectorStore()
+    
+    monkeypatch.setattr(app, "agent_step", fake_agent_step,)
+    vectorstore = FakeVectorStore()
     result = app.run_loop(
         llm_config={"provider": "fake"},
         system_prompt="Test system prompt",
@@ -154,10 +159,9 @@ def test_run_loop(monkeypatch):
         vectorstore=vectorstore,
         max_steps=3,
         )
-    assert result["answer"]==(
-        "Egnyte is mentioned in the platform SOP."
-        )
-    assert vectorstore.search_calls==[("Egnyte",2)]
+    assert result["answer"]==("Egnyte is mentioned in the platform SOP. [1]")
+    assert (vectorstore.search_calls==[("Egnyte",2)])
+    assert (result["documents_used"][0]["file_name"]=="platform_sop.txt")
 
 def test_normal_question(monkeypatch,tmp_path,):
     chroma_directory=tmp_path / "chroma_db"
@@ -172,11 +176,11 @@ def test_normal_question(monkeypatch,tmp_path,):
         "answer": "Test answer",
         "steps": [],
         },)
-    def fail_if_indexing_is_called(*args, **kwargs):
+    def fail_if_reindex_is_called(*args, **kwargs):
         pytest.fail(
-            "indexing() must not run during a normal question."
+            "reindex_documents() must not run during a normal question."
         )
-    monkeypatch.setattr(app,"indexing",fail_if_indexing_is_called,)
+    monkeypatch.setattr(app,"reindex_documents",fail_if_reindex_is_called,)
     monkeypatch.setattr(sys,"argv",[
         "app.py",
         "--prompt",
@@ -184,31 +188,18 @@ def test_normal_question(monkeypatch,tmp_path,):
         ],)
     app.main()
 
-def test_reindex_loads_documents_once(monkeypatch,tmp_path,):
-    fake_vectorstore = FakeAddVectorStore()
-    indexing_calls = []
-    def fake_indexing(path, printing=False):
-        indexing_calls.append(path)
-        return [Document(
-            page_content=(
-                "This is a document used for reindex testing."
-            ),
-            metadata={
-                "file_name": "test.txt",
-                "source": "test.txt",
-                "file_type": ".txt",
-            },
-        )], []
-    monkeypatch.setattr(app,"CHROMA_DIR",tmp_path / "chroma_db",)
-    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path / "documents",)
+def test_reindex_calls_reindex_documents_once(monkeypatch,):
+    calls=[]
+    
+    def fake_reindexing(embeddings, export_drive=False):
+        calls.append({"export_drive": export_drive})
+        return object()
+
     monkeypatch.setenv("OPENAI_API_KEY", "fake-test-key",)
     monkeypatch.setattr(app, "OpenAIEmbeddings",lambda **kwargs: object(),)
-    monkeypatch.setattr(app, "Chroma",lambda **kwargs: fake_vectorstore,)
-    monkeypatch.setattr(app, "indexing", fake_indexing,)
-    monkeypatch.setattr(sys, "argv",[
-        "app.py",
-        "--reindex",
-        ],)
+    monkeypatch.setattr(app, "reindex_documents", fake_reindexing)
+    monkeypatch.setattr(sys, "argv", ["app.py","--reindex",],)
+
     app.main()
-    assert len(indexing_calls) == 1
-    assert len(fake_vectorstore.added_documents) >= 1
+    assert len(calls) == 1
+    assert (calls[0]["export_drive"] is False)

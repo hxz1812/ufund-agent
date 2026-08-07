@@ -37,19 +37,61 @@ test("server-renders the UFund chat interface", async () => {
 });
 
 test("keeps the Python script behind an independent-message bridge", async () => {
-  const [page, layout, viteConfig, packageJson] = await Promise.all([
+  const [page, layout, viteConfig, packageJson, parserSource] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../vite.config.ts", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
+    readFile(new URL("../build/script-result.mjs", import.meta.url), "utf8"),
   ]);
 
-  assert.match(page, /body:\s*JSON\.stringify\(\{ message: question \}\)/);
-  assert.match(page, /Each question runs independently/);
+  assert.match(page, /body:\s*JSON\.stringify\(\{ message: question, options: runSettings \}\)/);
+  assert.match(page, /independent questions/);
   assert.match(viteConfig, /"Desktop", "ufund-agent", "app\.py"/);
-  assert.match(viteConfig, /\[scriptPath, "--prompt", message\]/);
+  assert.match(viteConfig, /buildChatArguments\(message, options\)/);
+  assert.match(viteConfig, /"--llm-provider"/);
+  assert.match(viteConfig, /"--openai-model"/);
+  assert.match(viteConfig, /"--max-tokens"/);
+  assert.match(viteConfig, /"--temperature"/);
+  assert.match(viteConfig, /"--n-ctx"/);
+  assert.match(viteConfig, /"--max-steps"/);
+  assert.match(viteConfig, /"--trace"/);
+  assert.match(viteConfig, /pathname === "\/api\/reindex"/);
+  assert.match(viteConfig, /"--reindex"/);
+  assert.match(viteConfig, /"--export-drive"/);
   assert.match(viteConfig, /process\.env\.UFUND_SCRIPT_PATH/);
   assert.match(viteConfig, /process\.env\.UFUND_PYTHON_BIN/);
+  assert.match(viteConfig, /indexFound/);
+  assert.match(viteConfig, /parseScriptOutput/);
+  assert.match(page, /documentsUsed/);
+  assert.match(page, /source-card/);
+  assert.match(page, /Run settings/);
+  assert.match(page, /Rebuild document index/);
+  assert.match(parserSource, /documents_used/);
   assert.match(layout, /title: "UFund Knowledge Assistant"/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
+});
+
+test("parses the updated app.py structured result", async () => {
+  const { parseScriptOutput } = await import("../build/script-result.mjs");
+  const result = parseScriptOutput(JSON.stringify({
+    answer: "The investment memo supports this claim [2].",
+    documents_used: [{
+      evidence_id: 2,
+      file_name: "Investment memo.pdf",
+      source_system: "google_drive",
+      relative_path: "Deals/Investment memo.pdf",
+      file_type: ".pdf",
+      sheet_name: null,
+      row_start: null,
+      row_end: null,
+    }],
+    steps: [{ action: "tool_use" }, { action: "final_answer" }],
+  }, null, 2));
+
+  assert.equal(result.answer, "The investment memo supports this claim [2].");
+  assert.equal(result.documentsUsed.length, 1);
+  assert.equal(result.documentsUsed[0].evidenceId, 2);
+  assert.equal(result.documentsUsed[0].fileName, "Investment memo.pdf");
+  assert.equal(result.stepCount, 2);
 });

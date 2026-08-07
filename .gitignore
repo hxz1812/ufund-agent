@@ -11,3 +11,5 @@ reindex_state.json
 __pycache__/
 .pytest_cache/
 *.pyc
+
+chat-assistant/build/script-result.mjs

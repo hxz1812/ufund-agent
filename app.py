@@ -1,11 +1,10 @@
+#TODO: Separate components of app.py into multiple files
 from dotenv import load_dotenv
-import sys
 import argparse
 from llama_cpp import Llama
 from pathlib import Path
 
 import json
-import time
 import io
 import os
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -17,18 +16,13 @@ from langchain_community.document_loaders import (
 )
 from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-import tiktoken
-import numpy as np
-from langchain_core.load import dumps, loads
 
-from typing import Any, List, Optional, Callable
+from typing import Any
 import shutil
 
 from openpyxl import load_workbook
@@ -41,9 +35,6 @@ from datetime import datetime, timezone
 
 
 model_path = str(Path.home() / "Desktop" / "agents-from-scratch" / "models" / "llama-3-8b-instruct.gguf")
-
-stop = ["<|eot_id|>","User:"]
-
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
@@ -98,14 +89,6 @@ RAG_ANSWER_SCHEMA = """
 }
 """
 
-TOOL_CHOICES = [
-    "calculator",
-    "search_docs",
-    "summarize_docs",
-    "answer_from_docs",
-    "none",
-]
-
 DROPBOX_DIR_TEXT = os.getenv("DROPBOX_DIR")
 
 DROPBOX_DIR = (
@@ -114,15 +97,16 @@ DROPBOX_DIR = (
     else None
 )
 
-ToolHandler = Callable[[dict, Any], Any]
-
 DEFAULT_SEARCH_K = 4
 SUMMARY_PAGE_SIZE = 500
 TRACE_DIR = BASE_DIR / "local_traces"
 
+SYSTEM_PROMPT=("You are an assistant who truthfully and thoughtfully answers "
+               "questions the members of UFund Investment LLC have.")
+
 def main() -> None:
     args = parse_args()
-    
+
     user_input=args.prompt
     max_tokens=args.max_tokens
     temperature=args.temperature
@@ -134,13 +118,6 @@ def main() -> None:
     reindex=args.reindex
     trace=args.trace
 
-    system_prompt=("You are an assistant who truthfully and thoughtfully answers questions the members of UFund Investment LLC have.")
-
-    if export_drive and not reindex:
-        raise ValueError(
-            "--export-drive must be used together with --reindex."
-        )
-
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError(
             "Missing OPENAI_API_KEY. "
@@ -151,29 +128,36 @@ def main() -> None:
         model=EMBEDDING_MODEL
     )
 
-    if not reindex and not CHROMA_DIR.exists():
-        raise RuntimeError(
-            "No Chroma database exists. "
-            "Run with --reindex first."
-        )
-
     if reindex:
         vectorstore = reindex_documents(
             embeddings=embeddings,
             export_drive=export_drive,
         )
-        if not user_input:
-            return
-    else:
-        vectorstore = Chroma(
-            collection_name=CHROMA_COLLECTION,
-            persist_directory=str(CHROMA_DIR),
-            embedding_function=embeddings,
+        print("Reindexing completed.")
+        return
+
+    
+    if export_drive:
+        raise ValueError(
+            "--export-drive must be used together with --reindex."
         )
 
+    if not CHROMA_DIR.exists():
+        raise RuntimeError(
+            "No Chroma database exists. "
+            "Run with --reindex first."
+        )
+    
     if not user_input:
         raise ValueError(
             "--prompt is required unless you are using --reindex."
+        )
+    
+    #normal query path
+    vectorstore = Chroma(
+        collection_name=CHROMA_COLLECTION,
+        persist_directory=str(CHROMA_DIR),
+        embedding_function=embeddings,
         )
 
     llm_config = build_llm(
@@ -186,7 +170,7 @@ def main() -> None:
 
     agent_result = run_loop(
         llm_config=llm_config,
-        system_prompt=system_prompt,
+        system_prompt=SYSTEM_PROMPT,
         user_input=user_input,
         vectorstore=vectorstore,
         max_steps=max_steps,
@@ -196,24 +180,6 @@ def main() -> None:
     )
     print(json.dumps(agent_result, indent=2, ensure_ascii=False))
 
-'''
-    #multi query
-    template = """You are an AI language modle assistant. Your task is to generate
-five different versions of the given user question to retrieve relevant documents
-from a vector database. By generating multiple perspectives on the user question,
-your goal is to help the user overcome some of the limitations of the distance-based
-similarity search. Provide these alternative questions separated by newlines.
-Original question: {question}"""
-    prompt_perspectives=ChatPromptTemplate.from_template(template)
-    generate_queries=(
-        prompt_perspectives
-        | ChatOpenAI(temperature=0)
-        | StrOutputParser()
-        | (lambda x: x.split("\n"))
-        )
-    retrieval_chain = generate_queries | retriever.map() | get_unique_union
-    docs = retrieval_chain.invoke({"question":user_input})
-    #print(len(docs))'''
 
 ##############
 # PARSE ARGS #
@@ -270,9 +236,9 @@ def call_llm_text(llm_config, prompt, max_tokens=512, temperature=0, stop=None,)
     raise ValueError(f"Unsupported LLM provider: {provider}")
         
     
-##########################
-#    GDRIVE FUNCTIONS    #
-##########################
+####################
+# GDRIVE FUNCTIONS #
+####################
 def get_drive_service():
     creds=None
     if os.path.exists("token.json"):
@@ -781,75 +747,6 @@ def reindex_documents(embeddings, export_drive: bool = False,):
 
     return vectorstore
 
-def num_tokens_from_string(string: str, encoding_name: str) -> int:
-    encoding=tiktoken.get_encoding(encoding_name)
-    num_tokens=len(encoding.encode(string))
-    return num_tokens
-
-def cosine_similarity(vec1,vec2):
-    dot_product=np.dot(vec1,vec2)
-    norm_vec1=np.linalg.norm(vec1)
-    norm_vec2=np.linalg.norm(vec2)
-    return dot_product/(norm_vec1*norm_vec2)
-
-def format_docs(retrieved_docs):
-    return "\n\n".join(doc.page_content for doc in retrieved_docs)
-
-##################################
-# ACTUALLY RUNNING RAG + TRACING #
-##################################
-def run_rag_with_local_trace(question):
-    retrieved_docs=retriever.invoke(question)
-    context= "\n\n".join(doc.page_content for doc in retrieved_docs)
-    answer = answer_chain.invoke({
-        "context": context,
-        "question": question,
-        })
-    trace = {
-        "question": question,
-        "answer": answer,
-        "retrieved_docs": [
-            {
-                "file_name": doc.metadata.get("file_name"),
-                "source": doc.metadata.get("source"),
-                "file_type": doc.metadata.get("file_type"),
-                "preview": doc.page_content[:1000],
-                }
-            for doc in retrieved_docs
-            ],
-        "context_preview": context[:3000],
-        }
-    trace_path = TRACE_DIR / f"rag_trace{int(time.time())}.json"
-    with open(trace_path, "w", encoding = "utf-8") as f:
-        json.dump(trace, f, indent=2, ensure_ascii=False)
-    print("Saved local trace to:", trace_path)
-    return answer, retrieved_docs
-
-def answer_with_local_llm(llm, user_input, retrieved_docs, system_prompt, max_tokens=512, temperature=0):
-    context = "\n\n".join(doc.page_content for doc in retrieved_docs)
-    prompt = f"""{system_prompt}
-
-CRITICAL INSTRUCTIONS:
-1. Everything in your response will have evidence to support it from given documents and text.
-2. If you cannot find evidence or facts, you will respond with "I don't know."
-3. Keep the answer as brief as possible. Do not make things up, do not provide extra explanations.
-
-Question: {user_input}
-
-Context:
-{context}
-
-Answer:"""
-
-    response = llm(prompt,max_tokens=max_tokens,temperature=temperature,)
-    return response["choices"][0]["text"].strip()
-
-#union of retrieved docs
-def get_unique_union(documents: list[list]):
-    flattened_docs=[dumps(doc) for sublist in documents for doc in sublist]
-    unique_docs=list(set(flattened_docs))
-    return [loads(doc) for doc in unique_docs]
-
 #####################
 # STRUCTURED OUTPUT #
 #####################
@@ -870,156 +767,9 @@ def extract_json_from_text(text: str) -> dict | None:
 
     return None
 
-
-def generate_structured(
-    llm_config,
-    user_input: str,
-    schema: str,
-    system_prompt: str,
-    max_tokens: int = 512,
-    temperature: float = 0.0,
-    stop= None,
-) -> dict | None:
-
-    prompt = f"""{system_prompt}
-
-CRITICAL INSTRUCTIONS:
-1. Respond with ONLY valid JSON.
-2. No explanations, no markdown, no extra text before or after the JSON.
-3. Start your response with {{ and end with }}.
-4. Use only the retrieved context provided by the user request.
-5. If the answer is not supported by the context, set "answer" to "I don't know."
-
-Schema you must follow:
-{schema}
-
-User request:
-{user_input}
-
-Response (JSON only):"""
-
-    for attempt in range(3):
-        response = call_llm_text(llm_config=llm_config,prompt=prompt,max_tokens=max_tokens,temperature=temperature,stop=stop)
-        parsed = extract_json_from_text(response)
-        if parsed is not None:
-            return parsed
-
-    return None
-
-
-def answer_rag_structured(
-    llm_config,
-    user_input: str,
-    retrieved_docs,
-    system_prompt: str,
-    schema: str = RAG_ANSWER_SCHEMA,
-    max_tokens: int = 512,
-    temperature: float = 0.0,):
-    context = "\n\n".join(
-        f"File name: {doc.metadata.get('file_name')}\n"
-        f"Source: {doc.metadata.get('source')}\n"
-        f"Content:\n{doc.page_content}"
-        for doc in retrieved_docs
-    )
-
-    structured_user_input = f"""Question:
-{user_input}
-
-Retrieved context:
-{context}
-
-Instructions:
-- Answer using only the retrieved context.
-- Do not use outside knowledge.
-- If the retrieved context does not explicitly answer the question, set "answer" to "I don't know."
-- Put source file names in "evidence_files".
-- Use "confidence" as high, medium, or low.
-- If context is insufficient, explain what is missing in "missing_information".
-"""
-
-    return generate_structured(
-        llm_config=llm_config,
-        user_input=structured_user_input,
-        schema=schema,
-        system_prompt=system_prompt,
-        max_tokens=max_tokens,
-        temperature=temperature,
-    )
-
-###################
-# DECISION-MAKING #
-###################
-def decide(llm_config, system_prompt:str, user_input:str, choices: list[str],
-           max_tokens:int=512,temperature:float=0.0, stop:List[str]=["<|eot_id|>","User:"])->str | None:
-    options = "\n".join(f"- {choice}" for choice in choices)
-    prompt = f"""{system_prompt}
-You must choose ONE of the following options. Respond with ONLY valid JSON.
-
-CRITICAL INSTRUCTIONS:
-1. Response with ONLY valid JSON
-2. No explanations, no markdown, no other text
-3. Start your response with {{ and end with }}
-
-Available choices:
-{options}
-
-Required JSON format:
-{{"decision": "one_of_the_choices_above"}}
-
-User request: {user_input}
-
-Response (JSON only):"""
-
-    for attempt in range(3):
-        response = call_llm_text(llm_config=llm_config,prompt=prompt,
-                                 max_tokens=max_tokens,temperature=temperature,
-                                 stop=stop,)
-        parsed = extract_json_from_text(response)
-        if parsed and "decision" in parsed:
-            decision = parsed["decision"]
-            if decision in choices:
-                return decision
-    return None
-
 #########
 # TOOLS #
 #########
-def request_tool(llm_config, system_prompt:str, user_input:str, choices:list[str]=TOOL_CHOICES,max_tokens:int=512,temperature:float=0.0,
-                 stop:list[str]=["<|eot_id|>", "<|end_of_text|>", "\nUser request:", "\nInput:"])->dict|None:
-    options = "\n".join(f"- {choice}" for choice in choices)
-    prompt=f"""{system_prompt}
-
-You are a tool-calling assistant. When asked a math question, you must respond with ONLY valid JSON.
-
-Available tools: {options}
-
-Tool guidance:
-- calculator: use for arithmetic/math calculations
-- search_docs: use when the user asks to find information in documents
-- summarize_docs: use when the user asks to summarize documents
-- answer_from_docs: use when the user asks a question that should be answered from retrieved documents
-- none: use when no tool is needed
-
-CRITICAL INSTRUCTIONS:
-1. Respond with ONLY valid JSON
-2. No explanations, no markdown, no other text
-3. Start your response with {{ and end with }}
-
-Example output format:
-{{"tool": "calculator", "arguments": {{"a": 42, "b": 7, "operation": "divide"}}}}
-
-User request: {user_input}
-
-Response (JSON only):"""
-    for attempt in range(3):
-        response=call_llm_text(llm_config=llm_config,prompt=prompt,
-                               max_tokens=max_tokens,temperature=temperature,
-                               stop=stop,)
-        parsed=extract_json_from_text(response)
-        if parsed and "tool" in parsed and "arguments" in parsed:
-            return parsed
-    return None
-
 def execute_tool_call(tool_call:dict,vectorstore=None,)->Any:
     tool_name=tool_call.get("tool")
     arguments=tool_call.get("arguments",{}) or {}
@@ -1029,6 +779,7 @@ def execute_tool_call(tool_call:dict,vectorstore=None,)->Any:
     except Exception as e:
         return {"tool": tool_name, "arguments": arguments, "error": str(e), "success": False,}
 
+#TODO: Add new tools
 def search_docs(vectorstore, query: str, k: int = DEFAULT_SEARCH_K):
     retrieved_docs = vectorstore.similarity_search(
         query,
@@ -1062,7 +813,7 @@ def search_docs(vectorstore, query: str, k: int = DEFAULT_SEARCH_K):
         })
     return results
 
-def summarize_docs(vectorstore, limit:int=5):
+def summarize_docs(vectorstore, limit:int=5,page_size: int = SUMMARY_PAGE_SIZE,):
     file_names = set()
     offset = 0
     while True:
@@ -1118,9 +869,6 @@ def execute_summarize_docs(arguments: dict, vectorstore,):
     )
 
 
-def execute_none(arguments: dict, vectorstore,):
-    return "No tool used."
-
 TOOL_REGISTRY = {
     "search_docs": {
         "description": (
@@ -1142,11 +890,6 @@ TOOL_REGISTRY = {
             "limit": "integer, default 5",
         },
         "handler": execute_summarize_docs,
-    },
-    "none": {
-        "description": "Use when no tool is required.",
-        "arguments": {},
-        "handler": execute_none,
     },
 }
 
